@@ -1,0 +1,49 @@
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # âœ… FORCE Authorization header to PHP (MOST IMPORTANT)
+    RewriteCond %{HTTP:Authorization} ^(.*)
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%1]
+
+</IfModule>
+
+# âœ… Backup method (for some cPanel servers)
+SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+
+
+<IfModule mod_rewrite.c>
+    <IfModule mod_negotiation.c>
+        Options -MultiViews -Indexes +FollowSymLinks
+    </IfModule>
+
+    # -----------------------------------
+    # ðŸ”’ SECURITY: Block sensitive files
+    # -----------------------------------
+
+    <FilesMatch "\.(env|log|ini|sh|sql|conf)$">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+
+    RewriteRule (^|/)\.(?!well-known/) - [F,L]
+
+    <FilesMatch "(artisan|composer\.json|composer\.lock|package\.json|webpack\.mix\.js)">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+
+    # Map assets and storage
+    RewriteRule ^(assets|storage|images|css|js|favicon\.ico|robots\.txt)(.*)$ public/$1$2 [L,NC]
+
+    # Laravel routing
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# php -- BEGIN cPanel-generated handler, do not edit
+# Set the “ea-php82” package as the default “PHP” programming language.
+<IfModule mime_module>
+  AddHandler application/x-httpd-ea-php82 .php .php8 .phtml
+</IfModule>
+# php -- END cPanel-generated handler, do not edit

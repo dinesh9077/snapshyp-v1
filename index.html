@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+
+<style>
+body{
+    background:#f1f2f6;
+}
+
+.dashboard-card{
+    background:#fff;
+    padding:20px;
+    height:100%;
+    position:relative;
+    border-radius:0;   /* remove rounded gap look */
+    box-shadow:none;   /* remove shadow if flat design needed */
+    border:1px solid #e5e5e5;
+}
+
+.amount{
+    font-size:20px;
+    font-weight:600;
+}
+
+.icon-box{
+    position:absolute;
+    right:20px;
+    top:20px;
+    width:40px;
+    height:40px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#fff;
+    border-radius:8px;
+}
+
+.blue{background:#0d6efd;}
+.yellow{background:#ffc107;}
+.green{background:#28a745;}
+.teal{background:#20c997;}
+.orange{background:#fd7e14;}
+
+.welcome-card{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+}
+</style>
+</head>
+<body>
+
+<div class="container-fluid px-0">
+    <div class="row g-0">
+
+        <div class="col-lg-4">
+            <div class="dashboard-card welcome-card">
+                <div>
+                    <h5><b>WELCOME <span class="text-primary">JDAC!</span> SHIPMENT PROCESSING DASHBOARD</b></h5>
+                    <small>Our Shipment Is Almost Complete Dispatch.</small>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-2">
+            <div class="dashboard-card">
+                <div class="amount">₹ 98,926.00</div>
+                <small>Pending COD Remittance</small>
+                <div class="icon-box blue">🏦</div>
+            </div>
+        </div>
+
+        <div class="col-lg-2">
+            <div class="dashboard-card">
+                <div class="amount">₹ 311,513.85</div>
+                <small>Total Invoice Amount</small>
+                <div class="icon-box yellow">🧾</div>
+            </div>
+        </div>
+
+        <div class="col-lg-2">
+            <div class="dashboard-card">
+                <div class="amount">₹ 0.00</div>
+                <small>Today's Recharge</small>
+                <div class="icon-box green">💼</div>
+            </div>
+        </div>
+
+    </div>
+
+    <div class="row g-0">
+
+        <div class="col-lg-2">
+            <div class="dashboard-card">
+                <div class="amount">₹ 4,508.20</div>
+                <small>Available Wallet Balance</small>
+                <div class="icon-box teal">👛</div>
+            </div>
+        </div>
+
+        <div class="col-lg-2">
+            <div class="dashboard-card">
+                <div class="amount">₹ 4,750.20</div>
+                <small>Total Wallet Amount</small>
+                <div class="icon-box orange">💳</div>
+            </div>
+        </div>
+
+        <div class="col-lg-2">
+            <div class="dashboard-card">
+                <div class="amount">₹ 98,926.00</div>
+                <small>Pending COD Remittance</small>
+                <div class="icon-box blue">🏦</div>
+            </div>
+        </div>
+
+        <div class="col-lg-2">
+            <div class="dashboard-card">
+                <div class="amount">₹ 311,513.85</div>
+                <small>Total Invoice Amount</small>
+                <div class="icon-box yellow">🧾</div>
+            </div>
+        </div>
+
+        <div class="col-lg-2">
+            <div class="dashboard-card">
+                <div class="amount">₹ 0.00</div>
+                <small>Today's Recharge</small>
+                <div class="icon-box green">💼</div>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+</body>
+</html>

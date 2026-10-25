@@ -1,0 +1,296 @@
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use App\Models\Order; 
+use App\Models\StatusMapping; 
+use App\Services\DelhiveryB2CService; 
+use Illuminate\Support\Facades\Artisan;
+use Log;
+use App\Helpers\Helper;
+
+
+class UpdateOrderStatus extends Command
+{
+	/**
+	 * The name and signature of the console command.
+	 *
+	 * @var string
+	 */
+	protected $signature = 'shipment:update-status {status_courier}';
+
+	/**
+	 * The console command description.
+	 *
+	 * @var string
+	 */
+	protected $description = 'Shipment status update command'; 
+	protected $delhiveryB2CService; 
+	public function __construct(DelhiveryB2CService $delhiveryB2CService)
+	{
+		parent::__construct(); 
+		$this->delhiveryB2CService = $delhiveryB2CService; 
+	}
+ 
+	public function handle()
+	{ 
+		error_reporting(0);
+
+		$statusCourier = $this->argument('status_courier');
+
+		$statusCourier = $this->argument('status_courier');
+		if (empty($statusCourier)) {
+			return true;
+		}
+
+		Log::info('UpdateOrderStatus: Starting', [
+			'status_courier' => $statusCourier,
+			'timestamp' => now()->toDateTimeString()
+		]);
+
+		$statusCourierMap = StatusMapping::where('internal_status', $statusCourier)->first()->courier_status ?? [];
+		// Optimize query with chunking and selective loading 
+		$today = now()->toDateString();
+		$processedCount = 0;
+		$updatedCount = 0;
+
+		$statusMappings = StatusMapping::orderBy('position')->pluck('courier_status', 'internal_status')->toArray();
+		 
+		// Process orders in chunks to reduce memory usage
+		Order::with(['shippingCompany'])
+		->whereIn('status_courier', $statusCourierMap)
+		->whereNotNull('awb_number')
+		->where('awb_number', '!=', '')
+		->select(['id', 'status_courier', 'awb_number', 'lr_no', 'shipping_company_id', 'user_id'])
+		->chunk(50, function ($orders) use ($today, &$processedCount, &$updatedCount, &$statusMappings) {
+			
+			// Group orders by shipping company to optimize API calls
+			$ordersByCompany = $orders->groupBy('shipping_company_id'); 
+			foreach ($ordersByCompany as $companyId => $companyOrders) { 
+				$this->processOrdersByCompany($companyOrders, $today, $processedCount, $updatedCount, $statusMappings);
+			}
+		});
+			
+		Log::info('UpdateOrderStatus: Completed', [
+			'processed' => $processedCount,
+			'updated' => $updatedCount,
+			'timestamp' => now()->toDateTimeString()
+		]);
+		$this->info("Processed {$processedCount} orders, updated {$updatedCount} statuses.");
+	}
+
+	/**
+	 * Process orders grouped by shipping company for better performance
+	 */
+	private function processOrdersByCompany($orders, $today, &$processedCount, &$updatedCount, &$statusMappings)
+	{
+		foreach ($orders as $order) {
+			$processedCount++;
+			$tempStatus = $order->status_courier; 
+			
+			Log::info('Processing order', [
+				'order_id' => $order->id,
+				'awb' => $order->awb_number,
+				'current_status' => $tempStatus,
+				'shipping_company_id' => $order->shipping_company_id
+			]);
+			
+			$newStatus = $this->calculateNewStatus($order); 
+			
+			if ($tempStatus !== $newStatus && !empty($newStatus)) {
+				Log::info('Status changed', [
+					'order_id' => $order->id,
+					'awb' => $order->awb_number,
+					'old_status' => $tempStatus,
+					'new_status' => $newStatus
+				]);
+				
+				// Normalize status
+				if ($newStatus === 'Shipment delivered') {
+					$newStatus = 'delivered';
+				}
+
+				$updateData = ['status_courier' => strtolower($newStatus)];
+				
+				// Handle delivery status
+				if (strtolower($newStatus) === 'delivered') {
+					$updateData['delivery_date'] = $today;
+					
+					// Queue WhatsApp notification instead of sending immediately
+					try {
+						dispatch(function () use ($order) {
+							$whatsappService = app(\App\Services\WhatsappService::class);
+							$whatsappService->sendOrderNotification($order->fresh(), 'delivered');
+						});
+					} catch (\Exception $e) {
+						Log::error('WhatsApp notification queue failed: ' . $e->getMessage());
+					}
+				}
+
+				if (in_array(strtolower($newStatus), array_map('strtolower', $statusMappings['Out For Delivery']))) {
+
+					try {
+						// Ensure send_whatsapp_notify is always an array
+						$notifiedStatuses = is_array($order->send_whatsapp_notify)
+							? $order->send_whatsapp_notify
+							: json_decode($order->send_whatsapp_notify, true) ?? [];
+
+						if (!in_array('out_for_delivery', $notifiedStatuses)) {
+							// Dispatch queued job (best practice: use a Job class)
+							dispatch(function () use ($order) {
+								$whatsappService = app(\App\Services\WhatsappService::class);
+								$whatsappService->sendOrderNotification($order, 'out_for_delivery');
+
+								// Refresh order and update notification log
+								$updatedOrder = $order->fresh();
+								$notified = is_array($updatedOrder->send_whatsapp_notify)
+									? $updatedOrder->send_whatsapp_notify
+									: json_decode($updatedOrder->send_whatsapp_notify, true) ?? [];
+
+								$notified[] = 'out_for_delivery';
+								$updatedOrder->update(['send_whatsapp_notify' => $notified]);
+							}); // optional: set queue name
+						}
+					} catch (\Exception $e) {
+						Log::error('WhatsApp notification queue failed: ' . $e->getMessage());
+					}
+				}
+
+				if (in_array(strtolower($newStatus), array_map('strtolower', $statusMappings['In Transit']))) {
+
+					try {
+						// Ensure send_whatsapp_notify is always an array
+						$notifiedStatuses = is_array($order->send_whatsapp_notify)
+							? $order->send_whatsapp_notify
+							: json_decode($order->send_whatsapp_notify, true) ?? [];
+
+						if (!in_array('in_transit__reached_hub', $notifiedStatuses)) {
+							// Dispatch queued job (best practice: use a Job class)
+							dispatch(function () use ($order) {
+								$whatsappService = app(\App\Services\WhatsappService::class);
+								$whatsappService->sendOrderNotification($order, 'in_transit__reached_hub');
+
+								// Refresh order and update notification log
+								$updatedOrder = $order->fresh();
+								$notified = is_array($updatedOrder->send_whatsapp_notify)
+									? $updatedOrder->send_whatsapp_notify
+									: json_decode($updatedOrder->send_whatsapp_notify, true) ?? [];
+
+								$notified[] = 'in_transit__reached_hub';
+								$updatedOrder->update(['send_whatsapp_notify' => $notified]);
+							}); // optional: set queue name
+						}
+					} catch (\Exception $e) {
+						Log::error('WhatsApp notification queue failed: ' . $e->getMessage());
+					}
+				} 
+
+				if (in_array(strtolower($newStatus), array_map('strtolower', $statusMappings['RTO All']))) {
+
+					try {
+						// Ensure send_whatsapp_notify is always an array
+						$notifiedStatuses = is_array($order->send_whatsapp_notify)
+							? $order->send_whatsapp_notify
+							: json_decode($order->send_whatsapp_notify, true) ?? [];
+
+						if (!in_array('rto_return_to_origin', $notifiedStatuses)) {
+							// Dispatch queued job (best practice: use a Job class)
+							dispatch(function () use ($order) {
+								$whatsappService = app(\App\Services\WhatsappService::class);
+								$whatsappService->sendOrderNotification($order, 'rto_return_to_origin');
+
+								// Refresh order and update notification log
+								$updatedOrder = $order->fresh();
+								$notified = is_array($updatedOrder->send_whatsapp_notify)
+									? $updatedOrder->send_whatsapp_notify
+									: json_decode($updatedOrder->send_whatsapp_notify, true) ?? [];
+
+								$notified[] = 'rto_return_to_origin';
+								$updatedOrder->update(['send_whatsapp_notify' => $notified]);
+							}); // optional: set queue name
+						}
+					} catch (\Exception $e) {
+						Log::error('WhatsApp notification queue failed: ' . $e->getMessage());
+					}
+				} 
+
+				// Bulk update using query builder for better performance
+				$order->update($updateData);
+
+				Helper::orderActivity($order->id, "Order status updated: {$tempStatus} -> " . strtolower($newStatus) . " (auto_sync)");
+
+				// Apply RTO billing/refund immediately on first RTO transition.
+				if (in_array(strtolower($newStatus), array_map('strtolower', $statusMappings['RTO All'] ?? []))) {
+					Artisan::call('order:apply-rto-charge', ['order_id' => $order->id]);
+				}
+				$updatedCount++;
+				
+				Log::info('Order status updated', [
+					'order_id' => $order->id,
+					'awb' => $order->awb_number,
+					'final_status' => $newStatus
+				]);
+			}
+		}
+	}
+
+	private function calculateNewStatus($order)
+	{
+		$status = $order->status_courier;
+		
+		// Early return if no AWB number
+		if (empty($order->awb_number)) {
+			return $status;
+		}
+		
+		$shippingCompany = $order->shippingCompany;
+		if (!$shippingCompany) {
+			return $status;
+		}
+
+		try {
+			// Cache key for API responses to avoid duplicate calls
+			$cacheKey = "order_status_{$order->id}_{$order->awb_number}";
+			
+			switch ($shippingCompany->id) {
+				case 1: 
+					$status = $this->handleDelhiveryB2CTracking($order, $shippingCompany, $cacheKey);
+					break;
+				// Only Delhivery (ID=1) is supported for order status tracking
+				default:
+					Log::warning('Unsupported shipping company for tracking', [
+						'shipping_company_id' => $shippingCompany->id,
+						'order_id' => $order->id
+					]);
+					break;
+			}
+		} catch (\Exception $e) {
+			Log::error("Status tracking failed for order {$order->id}: " . $e->getMessage());
+		}
+
+		return $status;
+	}
+  
+	private function handleDelhiveryB2CTracking($order, $shippingCompany, $cacheKey)
+	{
+		$trackingResponse = $this->delhiveryB2CService->trackOrderByAwbNumber($order->awb_number, $shippingCompany);
+
+		if (isset($trackingResponse['response']['ShipmentData']) && !empty($trackingResponse['response']['ShipmentData'])) {
+			$shipstatus = $trackingResponse['response']['ShipmentData'][0]['Shipment']['Status']['Status'] ?? $order->status_courier;
+
+			if ($shipstatus != "Manifested") {
+				$statusType = $trackingResponse['response']['ShipmentData'][0]['Shipment']['Status']['StatusType'] ?? '';
+				
+				return match($statusType) {
+					"RT" => "rto",
+					"RT-IT" => "rto in transit",
+					"RT-DL" => "rto delivered", 
+					default => $shipstatus
+				};
+			}
+		}
+		
+		return $order->status_courier;
+	}
+}
