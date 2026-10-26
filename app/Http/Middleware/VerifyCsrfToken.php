@@ -16,6 +16,9 @@ class VerifyCsrfToken extends Middleware
         'recharge/wallet/response',
         'shopify-webhook/orders-create',
         'shopify-webhook/orders-cancelled',
+        // Verified by Shopify HMAC / WooCommerce API key in the controller, not by CSRF
+        'shopify-webhook/orders-updated',
+        'woocommerce/order/cancelled',
         'webhooks/*',
         'webhook/app-uninstalled',
         'shopify/bulk-shipment/now',

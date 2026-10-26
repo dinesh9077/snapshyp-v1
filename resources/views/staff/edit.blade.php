@@ -39,6 +39,7 @@
 					<div class="mb-3 col-md-6">
 						<label for="recipient-name" class="form-label">Password<span
 								class="text-danger">*</span></label>
+						{{-- xpass is stored encrypted; the model decrypts it for this admin screen --}}
 						<input type="text" class="form-control new-border-popups" id="password" name="password"
 							value="{{ $staff->xpass }}" autocomplete="off">
 					</div>

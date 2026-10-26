@@ -21,6 +21,7 @@ use App\Helpers\Helper;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Hash;
 use Str;
 use App\Models\Notification;
@@ -33,6 +34,7 @@ use App\Services\{
 use App\Jobs\ProcessBulkShipment;
 use App\Jobs\AppUninstalledJob;
 use App\Mail\OtpMail;
+use App\Support\EmailOtp;
 
 class ShopifyController extends Controller
 {
@@ -51,9 +53,14 @@ class ShopifyController extends Controller
 
     public function editAddress(Request $request)
     {
+        // The link is public (sent to the buyer on WhatsApp), so it must carry our signature
+        if (!$request->hasValidSignature()) {
+            return response("Invalid link or expired.", 403);
+        }
+
         try {
-            $encoded = $request->query('data');
-            $data = json_decode(base64_decode(urldecode($encoded)), true);
+            $encoded = (string) $request->query('data');
+            $data = json_decode(base64_decode(strtr($encoded, '-_', '+/')), true);
 
             if (!$data || empty($data['customer_address_id'])) {
                 return response("Invalid link or expired.", 400);
@@ -72,10 +79,18 @@ class ShopifyController extends Controller
                 'address' => $address,
                 'customer_name' => $customer_name,
                 'fromNumber' => $fromNumber,
+                // Hidden form field; updateAddress only accepts this address id and buyer number
+                'token' => $this->addressEditToken($address->id, $fromNumber),
             ]);
         } catch (\Exception $e) {
             return response("Error loading address: " . $e->getMessage(), 500);
         }
+    }
+
+    // Ties a public address-edit form to one address and one buyer WhatsApp number
+    private function addressEditToken($addressId, $fromNumber): string
+    {
+        return hash_hmac('sha256', $addressId . '|' . (string) $fromNumber, (string) config('app.key'));
     }
 
     public function updateAddress(Request $request)
@@ -87,7 +102,13 @@ class ShopifyController extends Controller
             'zip_code' => 'required|string|max:20',
             'from_number' => 'nullable|string',
             'customer_name' => 'nullable|string',
+            'token' => 'required|string',
         ]);
+
+        // Only the address (and buyer number) from a signed edit link may be changed
+        if (!hash_equals($this->addressEditToken($request->id, $request->from_number), (string) $request->token)) {
+            return redirect()->back()->withErrors(['error' => 'This link is invalid or has expired.']);
+        }
 
         DB::beginTransaction();
 
@@ -399,13 +420,15 @@ class ShopifyController extends Controller
             hash_hmac('sha256', $data, config('services.shopify_api_secret'), true)
         );
 
-        if (!hash_equals($hmacHeader, $calculatedHmac)) {
+        if (!hash_equals($calculatedHmac, (string) $hmacHeader)) {
             abort(401, 'Invalid webhook signature');
         }
     }
 
     public function shopUninstalled(Request $request)
     {
+        // Uninstall deletes the shop link, so it must really come from Shopify
+        $this->verifyWebhook($request);
         \Log::info('GDPR shop/Uninstall', $request->all());
         $shopDomain = $request->header('X-Shopify-Shop-Domain');
         AppUninstalledJob::dispatch($shopDomain);
@@ -419,7 +442,7 @@ class ShopifyController extends Controller
             hash_hmac('sha256', $request->getContent(), config('services.shopify_api_secret'), true)
         );
 
-        if (!hash_equals($hmacHeader, $calculatedHmac)) {
+        if (!hash_equals($calculatedHmac, (string) $hmacHeader)) {
             Log::warning('Invalid HMAC for orders/create webhook');
             return response('Unauthorized', 401);
         }
@@ -443,8 +466,13 @@ class ShopifyController extends Controller
             return response('User is inactive', 200);
         }
 
+        // Shopify retries anything that isn't 2xx: answer 200 for orders we deliberately skip
+        if (!$user) {
+            return response('No seller linked to this shop', 200);
+        }
+
         if (($user->shopify_sync_mode ?? 'automatic') === "manual") {
-            return redirect('/apps/home?shop=' . $request->input('shop') . '&host=' . $request->query('host'));
+            return response('Manual sync mode, order not imported', 200);
         }
         $orderData = $request->all();
         Log::info("Order Created for {$shopDomain}", $orderData);
@@ -452,8 +480,15 @@ class ShopifyController extends Controller
         $shopifyOrderId = $orderData['id'];
         $shopifyOrderNumber = $orderData['order_number'] ?? $orderData['id'];
 
+        // Shopify can deliver the same webhook twice at once; only one request may import it
+        $lock = Cache::lock('shopify-order-create-' . $shopifyOrderId, 60);
+        if (!$lock->block(10)) {
+            return response('Already being imported', 200);
+        }
+
+        try {
         if (Order::where('shopify_order_number', $shopifyOrderId)->exists()) {
-            return response('Duplicate shopify order id', 404);
+            return response('Duplicate shopify order id', 200);
         }
 
         DB::beginTransaction();
@@ -490,7 +525,8 @@ class ShopifyController extends Controller
                 'status' => 1,
             ]);
 
-            $addressData = $orderData['customer']['default_address'] ?? null;
+            // Ship to the order's shipping address; the customer's default address may be a different place
+            $addressData = $orderData['shipping_address'] ?? $orderData['customer']['default_address'] ?? null;
             $customerAddress = null;
             if ($addressData) {
                 $address1 = $addressData['address1'] ?? '';
@@ -500,7 +536,7 @@ class ShopifyController extends Controller
                 $customerAddress = CustomerAddress::create([
                     'customer_id' => $customer->id,
                     'address' => $fullAddress,
-                    'country' => $addressData['country_name'] ?? 'India',
+                    'country' => $addressData['country_name'] ?? $addressData['country'] ?? 'India',
                     'state' => $addressData['province'] ?? '',
                     'city' => $addressData['city'] ?? '',
                     'zip_code' => $addressData['zip'] ?? '',
@@ -635,12 +671,16 @@ class ShopifyController extends Controller
             return response('OK', 200);
         } catch (\Exception $e) {
             DB::rollBack();
-            Log::info("Exception when storing order from Shopify", [
+            Log::error("Exception when storing order from Shopify", [
                 'error' => $e->getMessage()
             ]);
-        }
 
-        return response('OK', 200);
+            // 500 makes Shopify retry later instead of the order being silently lost
+            return response('Order import failed', 500);
+        }
+        } finally {
+            $lock->release();
+        }
     }
 
     public function sendWhatsAppMessage($order, $customerMobile)
@@ -756,7 +796,7 @@ class ShopifyController extends Controller
             hash_hmac('sha256', $request->getContent(), config('services.shopify_api_secret'), true)
         );
 
-        if (!hash_equals($hmacHeader, $calculatedHmac)) {
+        if (!hash_equals($calculatedHmac, (string) $hmacHeader)) {
             Log::warning('❌ Invalid Shopify webhook signature', ['header' => $hmacHeader]);
             return response()->json(['error' => 'Invalid signature'], 401);
         }
@@ -766,7 +806,7 @@ class ShopifyController extends Controller
             hash_hmac('sha256', $request->getContent(), config('services.shopify_api_secret'), true)
         );
 
-        if (!hash_equals($hmacHeader, $calculatedHmac)) {
+        if (!hash_equals($calculatedHmac, (string) $hmacHeader)) {
             Log::warning('Invalid HMAC for orders/create webhook');
             return response('Unauthorized', 401);
         }
@@ -867,7 +907,7 @@ class ShopifyController extends Controller
             hash_hmac('sha256', $request->getContent(), config('services.shopify_api_secret'), true)
         );
 
-        if (!hash_equals($hmacHeader, $calculatedHmac)) {
+        if (!hash_equals($calculatedHmac, (string) $hmacHeader)) {
             Log::warning('Invalid HMAC for orders/updated webhook');
             return response('Unauthorized', 401);
         }
@@ -1029,7 +1069,8 @@ class ShopifyController extends Controller
                     'status' => 1,
                 ]);
 
-                $addressData = $orderData['customer']['default_address'] ?? null;
+                // Ship to the order's shipping address; the customer's default address may be a different place
+                $addressData = $orderData['shipping_address'] ?? $orderData['customer']['default_address'] ?? null;
                 $customerAddress = null;
                 if ($addressData) {
                     $address1 = $addressData['address1'] ?? '';
@@ -1039,7 +1080,7 @@ class ShopifyController extends Controller
                     $customerAddress = CustomerAddress::create([
                         'customer_id' => $customer->id,
                         'address' => $fullAddress,
-                        'country' => $addressData['country_name'] ?? 'India',
+                        'country' => $addressData['country_name'] ?? $addressData['country'] ?? 'India',
                         'state' => $addressData['province'] ?? '',
                         'city' => $addressData['city'] ?? '',
                         'zip_code' => $addressData['zip'] ?? '',
@@ -1214,13 +1255,24 @@ class ShopifyController extends Controller
 
             DB::beginTransaction();
 
-            // ✅ Fetch user safely
-            $user = User::find($request->user_id);
+            // The shop's seller verified by ShopifyEmbeddedAuth, never a user_id from the request
+            $user = Auth::user();
 
             if (!$user) {
+                DB::rollBack();
                 return response()->json([
                     'status' => 'error',
                     'msg' => 'Invalid user. Please try again.',
+                ]);
+            }
+
+            // Only this seller's own orders
+            $orderIds = array_values(array_unique(array_filter($orderIds)));
+            if (Order::whereIn('id', $orderIds)->where('user_id', $user->id)->count() !== count($orderIds)) {
+                DB::rollBack();
+                return response()->json([
+                    'status' => 'error',
+                    'msg' => 'You can only ship your own orders.',
                 ]);
             }
 
@@ -1572,10 +1624,18 @@ class ShopifyController extends Controller
 
             if (!isset($request->is_verify_otp) && $request->is_verify_otp == 0) {
                 Mail::to($request->email)->send(new OtpMail($request->name, $generatedOTP));
-                return response()->json(['status' => 'mail', 'msg' => 'The mail send you have proveided email', 'otp' => $generatedOTP]);
+                EmailOtp::issue($request->email, $generatedOTP);
+                // Never return the OTP; it is checked server-side by register.verify-otp
+                return response()->json(['status' => 'mail', 'msg' => 'The mail send you have proveided email']);
             }
 
             DB::beginTransaction();
+
+            // The account is created only after the OTP for this email was verified
+            if (!EmailOtp::consumeVerified($request->email)) {
+                DB::rollBack();
+                return response()->json(['status' => 'error', 'msg' => 'Please verify the OTP sent to your email first.']);
+            }
 
             // Calculate next seller_id
             $maxSellerId = User::max('seller_id');
@@ -1591,8 +1651,8 @@ class ShopifyController extends Controller
                 'name' => $request->name,
                 'email' => $request->email,
                 'mobile' => $request->mobile,
-                'xpass' => $request->password,
                 'password' => Hash::make($request->password),
+                'xpass' => $request->password, // stored encrypted (User casts xpass)
                 'status' => 1,
                 'charge_type' => 1,
                 'charge' => 0,

@@ -66,10 +66,9 @@ class Kernel extends ConsoleKernel
 
         // Apply RTO billing/refund near realtime after status turns RTO
         $schedule->command('order:apply-rto-charge')->everyMinute()->withoutOverlapping();
-        $schedule->command('queue:work --tries=3')
-            ->everyMinute()
-            ->withoutOverlapping()
-            ->runInBackground();
+
+        // The queue worker runs from its own server cron (queue:work --stop-when-empty under flock),
+        // not from here, so only one worker system processes jobs.
 
         // Check pending COD remittances scheduled for today - runs daily at 9:00 AM
         $schedule->command('remittance:check-pending')

@@ -38,7 +38,8 @@ return [
             'driver' => 'database',
             'table' => 'jobs',
             'queue' => 'default',
-            'retry_after' => 90,
+            // Must exceed the longest job timeout (ProcessBulkShipment: 3600s), or a running job is handed out again
+            'retry_after' => (int) env('QUEUE_RETRY_AFTER', 3700),
         ],
 
         'beanstalkd' => [

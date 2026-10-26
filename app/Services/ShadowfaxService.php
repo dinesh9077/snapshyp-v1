@@ -194,10 +194,10 @@ class ShadowfaxService
         if (str_contains($mode, 'surface')) { $orderService = 'surface'; }
 
         // 3. Build Payload matching v3 Specification with AWB
-        $paymentType = strtolower((string) ($order->payment_type ?? '1'));
-        $isCod = in_array($paymentType, ['cod', '2']);
+        // Orders store the payment type in order_type ('cod' / 'prepaid'); collect cod_amount, not invoice value
+        $isCod = OrderType::isCod($order->order_type);
         $paymentMode = $isCod ? 'COD' : 'Prepaid';
-        $codAmount = $isCod ? (string) $order->invoice_amount : "0";
+        $codAmount = $isCod ? (string) ((float) $order->cod_amount > 0 ? $order->cod_amount : $order->invoice_amount) : "0";
 
         $productItems = [];
         foreach ($order->orderItems as $item) {
@@ -539,6 +539,17 @@ class ShadowfaxService
     {
         $status = (int) ($result['status'] ?? 0);
         $message = strtolower((string) ($result['message'] ?? ''));
+        $body = is_array($result['response'] ?? null) ? $result['response'] : [];
+
+        // Shadowfax answers HTTP 200 with message "Failure" + errors when it refuses (e.g. already
+        // picked up); treating that as cancelled would refund a shipment that is still moving
+        $bodyFailed = strtolower((string) ($body['message'] ?? '')) === 'failure'
+            || !empty($body['errors'])
+            || (array_key_exists('success', $body) && $body['success'] === false)
+            || in_array(strtolower((string) ($body['status'] ?? '')), ['failure', 'failed', 'error'], true);
+        if ($bodyFailed) {
+            return false;
+        }
 
         if (in_array($status, [200, 304], true)) {
             return true;

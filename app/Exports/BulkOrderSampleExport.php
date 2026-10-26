@@ -146,6 +146,7 @@ class BulkOrderSampleExport implements FromArray, WithHeadings
             '30',
             '20',
             '15',
+            'REF-123',
         ]];
     }
 }

@@ -471,10 +471,10 @@ class OrderController extends Controller
 				// Customer details + Tooltip
 				'customer_details' => "
 						<div class='main-cont1-2 customer-details-wrap'>
-							<p><strong>" . optional($customer)->first_name . " " . optional($customer)->last_name . "</strong></p>
-							<p class='small-text'>" . optional($customer)->mobile . "</p>
-							 <div class='tooltip small-text'>View Address<span class='tooltiptext'><b>" . optional($customer)->first_name . " " . optional($customer)->last_name .
-					"</b><br><b>Address</b>: " . $address . "</span></div>
+							<p><strong>" . e(optional($customer)->first_name . " " . optional($customer)->last_name) . "</strong></p>
+							<p class='small-text'>" . e(optional($customer)->mobile) . "</p>
+							 <div class='tooltip small-text'>View Address<span class='tooltiptext'><b>" . e(optional($customer)->first_name . " " . optional($customer)->last_name) .
+					"</b><br><b>Address</b>: " . e($address) . "</span></div>
 						</div>
 					",
 
@@ -944,7 +944,7 @@ class OrderController extends Controller
 			$output .= "<a class='dropdown-item' href='" . url("order/details/{$order->id}") . "?weight_order=" . $weightOrder . "&status=" . ucwords($status) . "'>View Order</a>
 				<hr class='m-0' />";
 
-			if (strtolower($order->status_courier) === "lost" && !($order->is_credited ?? false)) {
+			if (strtolower($order->status_courier) === "lost" && !($order->is_credited ?? false) && auth()->user()->role !== 'user') {
 				$output .= "<a class='dropdown-item' href='javascript:;' onclick='openCreditModal(this)' data-id='{$order->id}' data-invoice-amount='{$order->invoice_amount}' data-order-prefix='{$order->order_prefix}'> Credit Lost Order </a><hr class='m-0' />";
 			}
 			if ($canClone) {
@@ -980,7 +980,7 @@ class OrderController extends Controller
 					// }
 					$output .= "<a class='dropdown-item' href='" . url("order/download-label/{$order->id}") . "?weight_order=" . $weightOrder . "' target='_blank'> Order Label </a><hr class='m-0' />";
 
-					if (in_array(strtolower($order->status_courier), ["manifested", "in transit", "Pickup Pending", "open", "scheduled"])) {
+					if (in_array(strtolower($order->status_courier), ["manifested", "in transit", "pending pickup", "pickup pending", "open", "scheduled"])) {
 						if ($canCancel) {
 							$output .= "<a class='dropdown-item' href='" . url("order/cancel-api/{$order->id}") . "?weight_order=" . $weightOrder . "' data-order_prefix='{$order->order_prefix}' style='color: red;' onclick='cancelOrderApi(this, event)'>
 								Cancel Order
@@ -1016,7 +1016,17 @@ class OrderController extends Controller
 			'note' => 'nullable|string'
 		]);
 
+		// Crediting a lost shipment is an admin/staff decision
+		if (Auth::user()->role === 'user') {
+			abort(403);
+		}
+
 		$order = Order::findOrFail($request->order_id);
+		$this->authorizeOrderAccess($order);
+
+		if (strtolower((string) $order->status_courier) !== 'lost') {
+			return response()->json(['status' => 'error', 'msg' => 'Only lost orders can be credited.']);
+		}
 
 		// Validation: Max amount = min(invoice_amount, 2000)
 		$maxAmount = min($order->invoice_amount, 2000);
@@ -1025,18 +1035,18 @@ class OrderController extends Controller
 			return response()->json(['status' => 'error', 'msg' => "Amount cannot exceed ₹{$maxAmount} (Max limit: Invoice Amount or ₹2000)"]);
 		}
 
-		// Check if already credited
-		$existingCredit = UserWallet::where('order_id', $order->id)
-			->where('transaction_type', 'Lost Order Credit')
-			->first();
+		$credited = DB::transaction(function () use ($order, $request) {
+			// Lock the seller row so two requests can't both pass the "already credited" check
+			$user = User::whereKey($order->user_id)->lockForUpdate()->firstOrFail();
 
-		if ($existingCredit) {
-			return response()->json(['status' => 'error', 'msg' => 'This order has already been credited.']);
-		}
+			$existingCredit = UserWallet::where('order_id', $order->id)
+				->where('transaction_type', 'Lost Order Credit')
+				->exists();
+			if ($existingCredit) {
+				return false;
+			}
 
-		DB::transaction(function () use ($order, $request) {
 			// Credit User Wallet
-			$user = User::findOrFail($order->user_id);
 			$user->increment('wallet_amount', $request->amount);
 
 			// Log in UserWallet
@@ -1062,7 +1072,13 @@ class OrderController extends Controller
 				'amount' => $request->amount,
 				'note' => $request->note ?? "Credit for Lost Order #{$order->order_prefix}"
 			]);
+
+			return true;
 		});
+
+		if (!$credited) {
+			return response()->json(['status' => 'error', 'msg' => 'This order has already been credited.']);
+		}
 
 		return response()->json(['status' => 'success', 'msg' => 'Credit added successfully.']);
 	}
@@ -1197,13 +1213,45 @@ class OrderController extends Controller
 		}
 	}
 
+	// On clone, the form sends the source order's item IDs; load the ones this user may access
+	private function cloneSourceItems($request)
+	{
+		$ids = array_filter((array) $request->input('item_id', []));
+		if (empty($ids)) {
+			return collect();
+		}
+
+		$accessibleOrderIds = $this->applyOwnershipScope(Order::query(), Auth::user())->select('id');
+		return OrderItem::whereIn('id', $ids)->whereIn('order_id', $accessibleOrderIds)->get()->keyBy('id');
+	}
+
+	// Copy the source item's GST lines, scaled if the line total (amount × qty) changed
+	private function clonedItemGst($sourceItem, $amount, $quantity)
+	{
+		if (!$sourceItem || empty($sourceItem->gst)) {
+			return null;
+		}
+
+		$sourceTotal = (float) $sourceItem->amount * (int) $sourceItem->quantity;
+		$ratio = $sourceTotal > 0 ? ((float) $amount * (int) $quantity) / $sourceTotal : 1;
+
+		return array_map(function ($line) use ($ratio) {
+			$line['price'] = number_format((float) ($line['price'] ?? 0) * $ratio, 2, '.', '');
+			return $line;
+		}, $sourceItem->gst);
+	}
+
 	private function b2cStore($order, $request)
 	{
 		$orderItems = [];
+		$sourceItems = $this->cloneSourceItems($request);
+		$gstTotal = 0;
 		if (!empty($request->product_category)) {
 			foreach ($request->product_category as $key => $productCategory) {
 				$amount = $request->amount[$key] ?? 0;
 				$quantity = $request->quantity[$key] ?? 1;
+				$gst = $this->clonedItemGst($sourceItems->get($request->item_id[$key] ?? null), $amount, $quantity);
+				$gstTotal += array_sum(array_column($gst ?? [], 'price'));
 
 				$orderItems[] = [
 					'order_id' => $order->id,
@@ -1214,11 +1262,17 @@ class OrderController extends Controller
 					'amount' => $amount,
 					'ewaybillno' => null,
 					'quantity' => $quantity,
+					// insert() skips model casts, so encode GST here
+					'gst' => $gst ? json_encode($gst) : null,
 					'created_at' => now(),
 					'updated_at' => now()
 				];
 			}
 			OrderItem::insert($orderItems);
+
+			if ($gstTotal > 0) {
+				$order->update(['total_gst_amount' => round($gstTotal, 2)]);
+			}
 		}
 	}
 
@@ -1285,23 +1339,50 @@ class OrderController extends Controller
 		DB::beginTransaction();
 		$request->merge(['weight_order' => 1]); // Force B2C
 		try {
-			$user_id = Auth::id();
-			$exclude = ['_token', 'product_name', 'product_category', 'sku_number', 'hsn_number', 'amount', 'quantity', 'order_image', 'invoice_document', 'first_name', 'last_name', 'email', 'gst_number', 'mobile', 'address', 'country', 'state', 'city', 'zip_code'];
-			if ($request->weight_order == 2) {
-				$exclude = array_merge($exclude, ['weight', 'length', 'width', 'height']);
+			$order = Order::findOrFail($id);
+			$this->authorizeOrderAccess($order);
+			// The order stays with its seller even when an admin/staff edits it
+			$user_id = $order->user_id;
+
+			// Charges, AWB, remittance etc. are set by shipping; once shipped the order is locked
+			if (strtolower((string) $order->status_courier) !== 'new') {
+				DB::rollback();
+				return response()->json(['status' => 'error', 'msg' => 'Only new orders can be edited.']);
 			}
-			$data = $request->except($exclude);
+
+			// Only the fields on the edit form; never charges, status, AWB, owner or order number
+			$fields = ['reference_number', 'order_date', 'order_type', 'cod_amount', 'warehouse_id', 'customer_id', 'customer_address_id',
+				'invoice_no', 'invoice_amount', 'ewaybillno', 'dimension_type', 'insurance_type', 'weight_order'];
+			if ($request->weight_order != 2) {
+				$fields = array_merge($fields, ['length', 'width', 'height']);
+			}
+			$data = $request->only($fields);
+
+			if (!OrderType::isValid($request->order_type)) {
+				DB::rollback();
+				return response()->json(['status' => 'error', 'msg' => OrderType::INVALID_MESSAGE]);
+			}
+			$data['order_type'] = OrderType::sanitize($request->order_type);
 
 			if (empty($request->reference_number)) {
+				DB::rollback();
 				return response()->json(['status' => 'error', 'msg' => 'Reference number is required.']);
 			}
 
 			if (Order::where('user_id', $user_id)->where('reference_number', $request->reference_number)->where('id', '!=', $id)->exists()) {
+				DB::rollback();
 				return response()->json(['status' => 'error', 'msg' => 'This reference number already used']);
 			}
 
-			$order = Order::findOrFail($id);
-			$this->authorizeOrderAccess($order);
+			// Warehouse, customer and address must belong to this order's seller
+			$ownsWarehouse = CourierWarehouse::whereKey($request->warehouse_id)->where('user_id', $user_id)->exists()
+				|| $this->applyOwnershipScope(CourierWarehouse::whereKey($request->warehouse_id), Auth::user())->exists();
+			$ownsCustomer = Customer::whereKey($request->customer_id)->where('user_id', $user_id)->exists();
+			$ownsAddress = CustomerAddress::whereKey($request->customer_address_id)->where('customer_id', $request->customer_id)->exists();
+			if (!$ownsWarehouse || !$ownsCustomer || !$ownsAddress) {
+				DB::rollback();
+				return response()->json(['status' => 'error', 'msg' => 'Invalid pickup location, customer or address selected.']);
+			}
 			// $order->customer()->update([
 			// 	'user_id'    => $user_id,
 			// 	'first_name' => $request->first_name,
@@ -1326,13 +1407,11 @@ class OrderController extends Controller
 			// 	]);
 			// }
 
-			$data['user_id'] = $user_id;
 			$data['shipping_mode'] = 'Surface';
 			$data['is_fragile_item'] = $request->is_fragile_item ?? 0;
 			$data['weight'] = $request->total_weight;
 			$data['total_amount'] = $request->invoice_amount;
 			$data['status'] = 1;
-			$data['created_at'] = now();
 			$data['updated_at'] = now();
 
 			$imagePaths = $order->order_image ?? [];
@@ -1383,10 +1462,11 @@ class OrderController extends Controller
 	private function b2cUpdate($order, $request)
 	{
 		$orderItems = [];
-		$itemIds = array_values(array_filter((array) $request->input('item_id', [])));
+		// Keep the original keys so each item_id stays aligned with its product row
+		$itemIds = (array) $request->input('item_id', []);
 
 		if (!empty($request->product_category)) {
-			OrderItem::where('order_id', $order->id)->whereNotIn('id', $itemIds)->delete();
+			OrderItem::where('order_id', $order->id)->whereNotIn('id', array_filter($itemIds))->delete();
 			foreach ($request->product_category as $key => $productCategory) {
 				$amount = $request->amount[$key] ?? 0;
 				$quantity = $request->quantity[$key] ?? 1;
@@ -1403,12 +1483,12 @@ class OrderController extends Controller
 					'updated_at' => now()
 				];
 
-				// Check if order_item_id exists in the request
-				if (!empty($itemIds[$key])) {
-					$orderItem = OrderItem::find($itemIds[$key]);
-					if ($orderItem) {
-						$orderItem->update($orderItemData); // Update existing item
-					}
+				// Only items of this order can be updated; any other id is treated as a new row
+				$orderItem = !empty($itemIds[$key])
+					? OrderItem::where('order_id', $order->id)->find($itemIds[$key])
+					: null;
+				if ($orderItem) {
+					$orderItem->update($orderItemData); // Update existing item
 				} else {
 					$orderItemData['created_at'] = now();
 					$orderItems[] = $orderItemData; // Add new item for bulk insert
@@ -1580,6 +1660,11 @@ class OrderController extends Controller
 		DB::beginTransaction();
 		try {
 			$order = Order::find($id);
+			$this->authorizeOrderAccess($order);
+			if (strtolower((string) $order->status_courier) !== 'new') {
+				DB::rollBack();
+				return back()->with('error', 'Only new orders can be deleted.');
+			}
 			$order->orderItems()->delete();
 
 			$documents = [
@@ -1629,7 +1714,8 @@ class OrderController extends Controller
 	public function orderShippingLableDownload($orderId)
 	{
 		$order = Order::with('shippingCompany')->find($orderId);
-		if (!$order->shippingCompany && !empty($order->awb_number)) {
+		$this->authorizeOrderAccess($order);
+		if (!$order->shippingCompany || empty($order->awb_number)) {
 			return back()->with('error', 'Something went wrong');
 		}
 
@@ -1675,7 +1761,8 @@ class OrderController extends Controller
 	public function orderWayBillCopy($orderId)
 	{
 		$order = Order::with('shippingCompany')->find($orderId);
-		if (!$order->shippingCompany && !empty($order->awb_number)) {
+		$this->authorizeOrderAccess($order);
+		if (!$order->shippingCompany || empty($order->awb_number)) {
 			return back()->with('error', 'Something went wrong');
 		}
 		if ($order->shippingCompany->id == 1) {
@@ -1736,6 +1823,7 @@ class OrderController extends Controller
 			'warehouse',
 			'orderItems'
 		])->findOrFail($orderId);
+		$this->authorizeOrderAccess($order);
 
 		// Amazon ATS Label check
 		$isAmazonATS = false;
@@ -1868,6 +1956,10 @@ class OrderController extends Controller
 		try {
 			$orderIds = $request->input('order_ids');
 			if (empty($orderIds) || !is_array($orderIds)) {
+				return back()->with('error', 'No orders selected');
+			}
+			$orderIds = $this->applyOwnershipScope(Order::whereIn('id', $orderIds), Auth::user())->pluck('id')->all();
+			if (empty($orderIds)) {
 				return back()->with('error', 'No orders selected');
 			}
 
@@ -2131,6 +2223,8 @@ class OrderController extends Controller
 			if (!$isQueuedCancellation && $user->role == "user") {
 				$walletRefund = $order->shipping_charge ?? 0;
 				$user->increment('wallet_amount', $walletRefund);
+				// Take back franchise earning / creator margin paid for this shipment
+				app(\App\Services\ShipmentProcessor::class)->reverseShippingCredits($order);
 
 				$isCod = strtolower($order->order_type ?? '') === 'cod';
 				$codCharges = (float) ($order->cod_charges ?? 0);
@@ -2207,6 +2301,7 @@ class OrderController extends Controller
 	public function orderTrackingHistory($orderId)
 	{
 		$order = Order::with('shippingCompany')->find($orderId);
+		$this->authorizeOrderAccess($order);
 		$shippingCompany = $order->shippingCompany ?? [];
 
 		if (!$shippingCompany) {
@@ -2398,6 +2493,7 @@ class OrderController extends Controller
 		if (!$order) {
 			return response()->json(['status' => 'error', 'message' => 'Order not found'], 404);
 		}
+		$this->authorizeOrderAccess($order);
 
 		$user = $order->user ?? null;
 		if (!$user) {
@@ -2609,7 +2705,7 @@ class OrderController extends Controller
 			$jsonWarehouse = htmlspecialchars(json_encode($pickupWarehouse), ENT_QUOTES, 'UTF-8');
 
 			$options[] = '<option value="' . $pickupWarehouse->id . '" data-warehouse=\'' . $jsonWarehouse . '\'>'
-				. $pickupWarehouse->warehouse_name . ' - (' . $pickupWarehouse->company_name . ')</option>';
+				. e($pickupWarehouse->warehouse_name . ' - (' . $pickupWarehouse->company_name . ')') . '</option>';
 		}
 
 		return response()->json([
@@ -2625,6 +2721,17 @@ class OrderController extends Controller
 	}
 
 	// Recipeint/Customer
+	// Sellers may use only their own customers (or the customer on one of their orders); staff/admin any
+	private function canUseCustomer($user, $customerId): bool
+	{
+		if ($user->role !== 'user') {
+			return true;
+		}
+
+		return Customer::whereKey($customerId)->where('user_id', $user->id)->exists()
+			|| Order::where('user_id', $user->id)->where('customer_id', $customerId)->exists();
+	}
+
 	public function orderCustomerList()
 	{
 		$user = Auth::user();
@@ -2636,7 +2743,7 @@ class OrderController extends Controller
 			if ($includeCustomerId) {
 				$customer->where(function ($query) use ($user, $includeCustomerId) {
 					$query->where('user_id', $user->id)
-						->orWhere('id', $includeCustomerId);
+						->orWhereIn('id', Order::where('user_id', $user->id)->where('customer_id', $includeCustomerId)->select('customer_id'));
 				});
 			} else {
 				$customer->where('user_id', $user->id);
@@ -2648,7 +2755,7 @@ class OrderController extends Controller
 
 		foreach ($customers as $customer) {
 			$options[] = '<option value="' . $customer->id . '">'
-				. $customer->first_name . ' ' . $customer->last_name . ' - (' . $customer->mobile . ')</option>';
+				. e($customer->first_name . ' ' . $customer->last_name . ' - (' . $customer->mobile . ')') . '</option>';
 		}
 
 		return response()->json([
@@ -2677,12 +2784,7 @@ class OrderController extends Controller
 		$customer->where('mobile', $mobile)->where('status', 1);
 		$foundCustomer = $customer->first();
 
-		// Step 2: If not found in user's data, search entire database
-		if (!$foundCustomer) {
-			$foundCustomer = Customer::where('mobile', $mobile)
-				->where('status', 1)
-				->first();
-		}
+		// No fallback to the whole database: other sellers' customers must stay private
 
 		if ($foundCustomer) {
 			return response()->json([
@@ -2706,14 +2808,16 @@ class OrderController extends Controller
 	public function orderCustomerAddressList($customerId)
 	{
 		$user = Auth::user();
-		$customerAddresses = CustomerAddress::where('customer_id', $customerId)->get();
+		$customerAddresses = $this->canUseCustomer($user, $customerId)
+			? CustomerAddress::where('customer_id', $customerId)->get()
+			: collect();
 
 		$options = ['<option value="">Select Customer Address</option>'];
 
 		foreach ($customerAddresses as $customerAddress) {
 			$jsonAddress = htmlspecialchars(json_encode($customerAddress), ENT_QUOTES, 'UTF-8');
 			$options[] = '<option value="' . $customerAddress->id . '" data-address=\'' . $jsonAddress . '\'>'
-				. $customerAddress->address . ' ' . $customerAddress->city . ' ' . $customerAddress->states . ' ' . $customerAddress->country . ', ' . $customerAddress->zip_code . '</option>';
+				. e($customerAddress->address . ' ' . $customerAddress->city . ' ' . $customerAddress->states . ' ' . $customerAddress->country . ', ' . $customerAddress->zip_code) . '</option>';
 		}
 
 		return response()->json([
@@ -2739,6 +2843,10 @@ class OrderController extends Controller
 		try {
 			DB::beginTransaction();
 			$customer = Customer::findOrFail($request->customer_id);
+			if (!$this->canUseCustomer(Auth::user(), $customer->id)) {
+				DB::rollBack();
+				return response()->json(['status' => 'error', 'msg' => 'Customer not found.'], 404);
+			}
 
 			if ($request->has('address') && count($request->address) > 0) {
 				$addresses = [];
@@ -2792,49 +2900,64 @@ class OrderController extends Controller
 
 		$user = Auth::user();
 		$typeOfPackage = (int) $request->type_of_package;
-		DB::beginTransaction(); // Begin Transaction
+
+		if (!$this->applyOwnershipScope(CourierWarehouse::whereKey($request->warehouse_id), $user)->exists()) {
+			return response()->json(['status' => 'error', 'msg' => 'Invalid pickup location selected.']);
+		}
 
 		try {
-			// Import the Excel file
 			$bulkOrder = new BulkOrder();
 			Excel::import($bulkOrder, $request->file('bulk_excel'));
+		} catch (\Throwable $e) {
+			return response()->json(['status' => 'error', 'msg' => 'Could not read the Excel file. Please use the sample format.']);
+		}
 
-			// Check if rows exist after removing the header
-			if (empty($bulkOrder->rows)) {
-				return response()->json(['status' => 'error', 'msg' => 'No valid data found in the Excel file.']);
+		// Validate every row first, so nothing is saved unless the whole file is valid
+		$validRows = [];
+		$rowErrors = [];
+		$seenReferences = [];
+
+		foreach ((array) $bulkOrder->rows as $index => $row) {
+			// Excel row number: +1 for the stripped header, +1 to make it 1-based.
+			$rowNumber = $index + 2;
+
+			// Excel often keeps empty formatted rows at the end of a sheet
+			if ($this->isBlankBulkRow((array) $row)) {
+				continue;
 			}
 
-			$rowErrors = [];
-
-			foreach ($bulkOrder->rows as $index => $row) {
+			try {
 				$row = $this->normalizeBulkImportRow((array) $row, $typeOfPackage);
+			} catch (\InvalidArgumentException $e) {
+				return response()->json(['status' => 'error', 'msg' => $e->getMessage()]);
+			}
 
-				// Excel row number: +1 for the stripped header, +1 to make it 1-based.
-				$rowNumber = $index + 2;
+			$errors = $this->validateBulkRow($row, $rowNumber, $typeOfPackage, $user, $seenReferences);
+			if (!empty($errors)) {
+				$rowErrors[] = ['row' => $rowNumber, 'message' => implode(' ', $errors)];
+				continue;
+			}
 
-				// Shared business rule: order_type must be COD or Prepaid. The raw cell
-				// is validated (not the "?? 'cod'" default) so empty / null / garbage fails
-				// instead of silently defaulting to COD.
-				if (!OrderType::isValid($row[2] ?? null)) {
-					$rowErrors[] = ['row' => $rowNumber, 'message' => OrderType::INVALID_MESSAGE];
-					continue;
-				}
-				// Persist the canonical lowercase value (accepts "COD", "Prepaid", etc.).
-				$row[2] = OrderType::sanitize($row[2]);
+			// Persist the canonical lowercase value (accepts "COD", "Prepaid", etc.).
+			$row[2] = OrderType::sanitize($row[2]);
+			$validRows[] = [$row, $this->parseBulkOrderDate($row[0] ?? null)];
+		}
 
-				$dateValue = $row[0] ?? null;
-				$orderDate = null;
+		if (!empty($rowErrors)) {
+			return response()->json([
+				'status' => 'error',
+				'msg'    => count($rowErrors) . ' row(s) have errors. No orders were imported.',
+				'errors' => $rowErrors,
+			]);
+		}
 
-				if ($dateValue) {
-					if (is_numeric($dateValue)) {
-						// Excel serial number → Carbon date
-						$orderDate = Date::excelToDateTimeObject($dateValue)->format('Y-m-d');
-					} else {
-						// If already string (like 2025-09-24)
-						$orderDate = \Carbon\Carbon::parse($dateValue)->format('Y-m-d');
-					}
-				}
+		if (empty($validRows)) {
+			return response()->json(['status' => 'error', 'msg' => 'No valid data found in the Excel file.']);
+		}
 
+		DB::beginTransaction();
+		try {
+			foreach ($validRows as [$row, $orderDate]) {
 				if ($typeOfPackage === 1) {
 					$this->b2cBulkStore($request, $user, $row, $orderDate);
 				} else {
@@ -2842,23 +2965,132 @@ class OrderController extends Controller
 				}
 			}
 
-			// Any invalid order_type aborts the whole import (nothing is committed) and the
-			// failing rows are returned as a report the UI can show.
-			if (!empty($rowErrors)) {
-				DB::rollback();
-				return response()->json([
-					'status' => 'error',
-					'msg'    => 'Some rows have an invalid Order Type. No orders were imported.',
-					'errors' => $rowErrors,
-				]);
-			}
-
-			DB::commit(); // Commit Transaction
-			return response()->json(['status' => 'success', 'msg' => 'The order has been successfully added.', 'type_of_package' => $typeOfPackage]);
+			DB::commit();
+			return response()->json(['status' => 'success', 'msg' => count($validRows) . ' order(s) imported successfully.', 'type_of_package' => $typeOfPackage]);
 		} catch (\Exception $e) {
-			DB::rollback(); // Rollback in case of failure
-			return response()->json(['status' => 'error', 'msg' => $e->getMessage()]);
+			DB::rollback();
+			Log::error('Bulk order import failed: ' . $e->getMessage());
+			return response()->json(['status' => 'error', 'msg' => 'Bulk order import failed. No orders were imported.']);
 		}
+	}
+
+	// "+91 98765-43210" / "098765 43210" -> "9876543210"
+	private function normalizeBulkMobile($mobile): string
+	{
+		$digits = preg_replace('/\D/', '', (string) $mobile);
+		if (strlen($digits) === 12 && str_starts_with($digits, '91')) {
+			return substr($digits, 2);
+		}
+		if (strlen($digits) === 11 && str_starts_with($digits, '0')) {
+			return substr($digits, 1);
+		}
+		return $digits;
+	}
+
+	private function isBlankBulkRow(array $row): bool
+	{
+		foreach ($row as $cell) {
+			if (trim((string) $cell) !== '') {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Excel serial number or a text date (Y-m-d, d-m-Y, d/m/Y, d.m.Y). Blank means today; null means unreadable.
+	private function parseBulkOrderDate($value): ?string
+	{
+		if ($value === null || trim((string) $value) === '') {
+			return now()->format('Y-m-d');
+		}
+
+		if (is_numeric($value)) {
+			return Date::excelToDateTimeObject($value)->format('Y-m-d');
+		}
+
+		foreach (['Y-m-d', 'd-m-Y', 'd/m/Y', 'd.m.Y', 'Y/m/d'] as $format) {
+			$date = \DateTime::createFromFormat('!' . $format, trim((string) $value));
+			if ($date && $date->format($format) === trim((string) $value)) {
+				return $date->format('Y-m-d');
+			}
+		}
+
+		return null;
+	}
+
+	// Returns a list of problems with one normalized bulk row (empty when the row is valid)
+	private function validateBulkRow(array $row, int $rowNumber, int $typeOfPackage, $user, array &$seenReferences): array
+	{
+		// Column positions after normalizeBulkImportRow; B2B has an extra insurance_type column
+		$col = $typeOfPackage === 2
+			? ['first_name' => 5, 'mobile' => 9, 'address' => 10, 'zip_code' => 11, 'city' => 12, 'state' => 13, 'product_name' => 16, 'amount' => 19, 'quantity' => 20, 'invoice_amount' => 22, 'reference' => 30]
+			: ['first_name' => 4, 'mobile' => 8, 'address' => 9, 'zip_code' => 10, 'city' => 11, 'state' => 12, 'product_name' => 15, 'amount' => 18, 'quantity' => 19, 'invoice_amount' => 21, 'reference' => 27];
+		$value = function ($key) use ($row, $col) {
+			return trim((string) ($row[$col[$key]] ?? ''));
+		};
+		$errors = [];
+
+		if (!OrderType::isValid($row[2] ?? null)) {
+			$errors[] = OrderType::INVALID_MESSAGE;
+		} elseif (OrderType::sanitize($row[2]) === 'cod' && !(is_numeric($row[3] ?? null) && $row[3] > 0)) {
+			$errors[] = 'COD amount is required for COD orders.';
+		}
+
+		if ($this->parseBulkOrderDate($row[0] ?? null) === null) {
+			$errors[] = 'Order date must be like 2026-10-25 or 25-10-2026.';
+		}
+
+		$reference = $value('reference');
+		if ($reference === '') {
+			$errors[] = 'Reference number is required.';
+		} elseif (isset($seenReferences[$reference])) {
+			$errors[] = "Reference number {$reference} is repeated in this file (row {$seenReferences[$reference]}).";
+		} elseif (Order::where('user_id', $user->id)->where('reference_number', $reference)->exists()) {
+			$errors[] = "Reference number {$reference} is already used.";
+		}
+		if ($reference !== '' && !isset($seenReferences[$reference])) {
+			$seenReferences[$reference] = $rowNumber;
+		}
+
+		foreach (['first_name' => 'First name', 'address' => 'Address', 'city' => 'City', 'state' => 'State'] as $key => $label) {
+			if ($value($key) === '') {
+				$errors[] = "{$label} is required.";
+			}
+		}
+
+		if (!preg_match('/^\d{10}$/', $this->normalizeBulkMobile($value('mobile')))) {
+			$errors[] = 'Mobile must be a 10-digit number.';
+		}
+
+		if (!preg_match('/^\d{6}$/', $value('zip_code'))) {
+			$errors[] = 'Pincode must be 6 digits.';
+		}
+
+		$names = array_filter(array_map('trim', explode(',', $value('product_name'))), 'strlen');
+		$amounts = array_map('trim', explode(',', $value('amount')));
+		$quantities = array_map('trim', explode(',', $value('quantity')));
+		if (empty($names)) {
+			$errors[] = 'At least one product name is required.';
+		} elseif (count($amounts) !== count($names) || count($quantities) !== count($names)) {
+			$errors[] = 'Product name, amount and quantity must have the same number of comma-separated values.';
+		} elseif (array_filter($amounts, fn($a) => !is_numeric($a) || $a < 0) || array_filter($quantities, fn($q) => !ctype_digit($q) || (int) $q < 1)) {
+			$errors[] = 'Product amounts must be numbers and quantities whole numbers of at least 1.';
+		}
+
+		if (!(is_numeric($value('invoice_amount')) && $value('invoice_amount') > 0)) {
+			$errors[] = 'Invoice amount must be a number greater than 0.';
+		}
+
+		if ($typeOfPackage === 1) {
+			foreach ([23 => 'Weight', 24 => 'Length', 25 => 'Width', 26 => 'Height'] as $index => $label) {
+				$cell = trim((string) ($row[$index] ?? ''));
+				if ($cell !== '' && !(is_numeric($cell) && $cell >= 0)) {
+					$errors[] = "{$label} must be a number.";
+				}
+			}
+		}
+
+		return $errors;
 	}
 
 	private function normalizeBulkImportRow(array $row, int $typeOfPackage): array
@@ -2903,7 +3135,7 @@ class OrderController extends Controller
 			'last_name'  => $row[5] ?? '',
 			'email'      => $row[6] ?? null,
 			'gst_number' => $row[7] ?? null,
-			'mobile'     => $row[8] ?? null,
+			'mobile'     => $this->normalizeBulkMobile($row[8] ?? ''),
 			'status'     => 1,
 		]);
 
@@ -2935,7 +3167,7 @@ class OrderController extends Controller
 			'order_date' => $orderDate,
 			'shipping_mode' => $row[1] ? strtolower($row[1]) : 'surface',
 			'order_type' => $row[2] ?? 'cod',
-			'cod_amount' => $row[3] ?? 0,
+			'cod_amount' => (float) ($row[3] ?? 0),
 			'warehouse_id' => $request->warehouse_id,
 			'customer_id' => $customer->id ?? null,
 			'customer_address_id' => $customerAddress->id ?? null,
@@ -2947,10 +3179,10 @@ class OrderController extends Controller
 			'user_id' => $user->id,
 			'status_courier' => 'New',
 			'weight_order' => 1,
-			'weight' => $row[23] ?? 0,
-			'length' => $row[24] ?? 0,
-			'width' => $row[25] ?? 0,
-			'height' => $row[26] ?? 0,
+			'weight' => (float) ($row[23] ?? 0),
+			'length' => (float) ($row[24] ?? 0),
+			'width' => (float) ($row[25] ?? 0),
+			'height' => (float) ($row[26] ?? 0),
 			'status' => 1,
 			'created_at' => now(),
 			'updated_at' => now()
@@ -2959,23 +3191,24 @@ class OrderController extends Controller
 		$order = Order::create($data);
 
 		// Extract and explode values
-		$productCategory = $row[14] ? explode(',', $row[14]) : null;
-		$productName = $row[15] ? explode(',', $row[15]) : null;
-		$productSku = $row[16] ? explode(',', $row[16]) : null;
-		$productHsn = $row[17] ? explode(',', $row[17]) : null;
-		$productAmount = $row[18] ? explode(',', $row[18]) : null;
-		$productQuantity = $row[19] ? explode(',', $row[19]) : null;
+		$productCategory = $row[14] ? array_map('trim', explode(',', $row[14])) : [];
+		$productName = $row[15] ? array_map('trim', explode(',', $row[15])) : null;
+		$productSku = $row[16] ? array_map('trim', explode(',', $row[16])) : null;
+		$productHsn = $row[17] ? array_map('trim', explode(',', $row[17])) : null;
+		$productAmount = $row[18] ? array_map('trim', explode(',', $row[18])) : null;
+		$productQuantity = $row[19] ? array_map('trim', explode(',', $row[19])) : null;
 
 
 		$orderItems = [];
 		$totalAmount = 0; // Initialize total amount
 
-		if ($productCategory) {
-			foreach ($productCategory as $key => $productCat) {
+		// Product name drives the rows; category is optional and falls back to the name
+		if ($productName) {
+			foreach ($productName as $key => $name) {
 				$orderItems[] = [
 					'order_id' => $order->id,
-					'product_category' => $productCat,
-					'product_name' => $productName[$key] ?? 0,
+					'product_category' => ($productCategory[$key] ?? '') !== '' ? $productCategory[$key] : $name,
+					'product_name' => $name,
 					'sku_number' => $productSku[$key] ?? null,
 					'hsn_number' => $productHsn[$key] ?? null,
 					'amount' => $productAmount[$key] ?? 0,
@@ -3010,7 +3243,7 @@ class OrderController extends Controller
 			'last_name'  => $row[6] ?? '',
 			'email'      => $row[7] ?? null,
 			'gst_number' => $row[8] ?? null,
-			'mobile'     => $row[9] ?? null,
+			'mobile'     => $this->normalizeBulkMobile($row[9] ?? ''),
 			'status'     => 1,
 		]);
 
@@ -3042,7 +3275,7 @@ class OrderController extends Controller
 			'order_date' => $orderDate,
 			'shipping_mode' => $row[1] ? strtolower($row[1]) : 'surface',
 			'order_type' => $row[2] ?? 'cod',
-			'cod_amount' => $row[3] ?? 0,
+			'cod_amount' => (float) ($row[3] ?? 0),
 			'insurance_type' => in_array((string) ($row[4] ?? '1'), ['1', '2'], true) ? (int) $row[4] : 1,
 			'warehouse_id' => $request->warehouse_id,
 			'customer_id' => $customer->id ?? null,
@@ -3360,10 +3593,16 @@ class OrderController extends Controller
 
 	public function storePayout(Request $request)
 	{
+		// Marking a COD payout as paid is an admin/staff action
+		if (Auth::user()->role === 'user') {
+			abort(403);
+		}
+
 		try {
 			DB::beginTransaction();
 
-			$data = $request->except('id', '_token');
+			// Only the payout form's fields; never the amount, owner or id of the voucher
+			$data = $request->only('payout_date', 'reference_no', 'remarks');
 			$data['voucher_status'] = 1;
 
 			$codPayout = CodVoucher::findOrFail($request->id);
@@ -3439,12 +3678,57 @@ class OrderController extends Controller
 		}
 	}
 
+	// Fields the package dimension forms are allowed to change
+	private const PACKAGE_DIMENSION_FIELDS = ['warehouse_id', 'weight', 'length', 'width', 'height'];
+
+	// Limit a query to records the user owns (same rule as the order listing)
+	private function applyOwnershipScope($query, $user)
+	{
+		if ($user->isMasterAdmin()) {
+			return $query;
+		}
+
+		if (in_array(strtolower((string) $user->role), ['admin', 'reseller', 'staff'], true)) {
+			return $query->where(function ($q) use ($user) {
+				$q->where('user_id', $user->id)
+					->orWhereHas('user', function ($uq) use ($user) {
+						$uq->where('staff_id', $user->id);
+					});
+			});
+		}
+
+		return $query->where('user_id', $user->id);
+	}
+
+	// Returns an error response if the data is empty or the warehouse isn't the user's, else null
+	private function validatePackageDimensionData(array $data, $user)
+	{
+		if (empty($data)) {
+			return response()->json(['status' => 'error', 'msg' => 'Enter at least one value to update.'], 422);
+		}
+
+		if (isset($data['warehouse_id']) && !$this->applyOwnershipScope(CourierWarehouse::whereKey($data['warehouse_id']), $user)->exists()) {
+			return response()->json(['status' => 'error', 'msg' => 'Invalid warehouse selected.'], 403);
+		}
+
+		return null;
+	}
+
 	public function orderPackageDimensionUpdate(Request $request)
 	{
-		$data = array_filter($request->except('_token', 'order_id'), function ($value) {
+		$user = Auth::user();
+		$data = array_filter($request->only(self::PACKAGE_DIMENSION_FIELDS), function ($value) {
 			return $value !== null && $value !== '' && $value !== '0' && $value !== 0;
 		});
 		$orderId = $request->order_id;
+
+		if ($error = $this->validatePackageDimensionData($data, $user)) {
+			return $error;
+		}
+
+		if (!$this->applyOwnershipScope(Order::whereKey($orderId), $user)->exists()) {
+			return response()->json(['status' => 'error', 'msg' => 'You can only update your own orders.'], 403);
+		}
 
 		DB::beginTransaction();
 		try {
@@ -3464,18 +3748,31 @@ class OrderController extends Controller
 
 	public function orderPackageDimensionBulkUpdate(Request $request)
 	{
-		$data = array_filter($request->except('_token', 'order_ids'), function ($value) {
+		$user = Auth::user();
+		$data = array_filter($request->only(self::PACKAGE_DIMENSION_FIELDS), function ($value) {
 			return $value !== null && $value !== '' && $value !== '0' && $value !== 0;
 		});
 		$orderIds = $request->order_ids ? explode(',', $request->order_ids) : [];
-		$orderIds = array_values(array_filter($orderIds, function ($id) {
+		$orderIds = array_values(array_unique(array_filter($orderIds, function ($id) {
 			return $id !== '';
-		}));
+		})));
 		if (empty($orderIds)) {
 			return response()->json([
 				'status' => 'error',
 				'msg' => 'No orders selected.'
 			], 400);
+		}
+
+		if ($error = $this->validatePackageDimensionData($data, $user)) {
+			return $error;
+		}
+
+		$ownedCount = $this->applyOwnershipScope(Order::whereIn('id', $orderIds), $user)->count();
+		if ($ownedCount !== count($orderIds)) {
+			return response()->json([
+				'status' => 'error',
+				'msg' => 'You can only update your own orders.'
+			], 403);
 		}
 
 		DB::beginTransaction();
@@ -3568,6 +3865,15 @@ class OrderController extends Controller
 			]);
 		}
 
+		$orderIds = array_values(array_unique($orderIds));
+		$ownedCount = $this->applyOwnershipScope(Order::whereIn('id', $orderIds), Auth::user())->count();
+		if ($ownedCount !== count($orderIds)) {
+			return response()->json([
+				'status' => 'error',
+				'msg' => 'You can only cancel your own orders.',
+			], 403);
+		}
+
 		DB::beginTransaction();
 		try {
 			$result = [
@@ -3604,6 +3910,11 @@ class OrderController extends Controller
 		$now = Carbon::now();
 		$chunkSize = 100;
 		$total = 0;
+
+		// Only orders not yet shipped can be cancelled here; shipped ones need a courier cancellation
+		$requested = count($orderIds);
+		$orderIds = Order::whereIn('id', $orderIds)->whereRaw('LOWER(status_courier) = ?', ['new'])->pluck('id')->all();
+		$skipped = $requested - count($orderIds);
 		foreach (array_chunk($orderIds, $chunkSize) as $chunk) {
 			$total += count($chunk);
 
@@ -3647,9 +3958,9 @@ class OrderController extends Controller
 		}
 
 		return [
-			'processed' => $total,
+			'processed' => $requested,
 			'cancelled' => $total,
-			'skipped' => 0,
+			'skipped' => $skipped,
 			'errors' => 0,
 		];
 	}
@@ -3765,6 +4076,8 @@ class OrderController extends Controller
 				if (!$isQueuedCancellation && $user->role === 'user') {
 					// Use update directly with increment to avoid fetching full user record
 					$user->increment('wallet_amount', $order->shipping_charge);
+					// Take back franchise earning / creator margin paid for this shipment
+					app(\App\Services\ShipmentProcessor::class)->reverseShippingCredits($order);
 
 					$walletRefund = (float) ($order->shipping_charge ?? 0);
 					$isCod = strtolower($order->order_type ?? '') === 'cod';

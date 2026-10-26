@@ -192,7 +192,7 @@ class ForgotPasswordController extends Controller
 			// Update user password
 			$user = User::where('email', $request->email)->firstOrFail();
 			$user->password = Hash::make($request->password);
-			$user->xpass = $request->password;
+			$user->xpass = $request->password; // stored encrypted (User casts xpass)
 			$user->password_updated_at = Carbon::now();
 			$user->save();
 

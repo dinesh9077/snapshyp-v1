@@ -752,6 +752,10 @@
 			try{
 
 				$invoiceDetail = Invoice::with('user')->findOrFail($invoiceId);
+				// A seller may download only their own invoices
+				if (Auth::user()->role === 'user' && (int) $invoiceDetail->user_id !== (int) Auth::id()) {
+					return $this->errorResponse('Invoice not found.', 404);
+				}
 				$user = $invoiceDetail->user;
 
 				$invoice = [
@@ -793,6 +797,10 @@
 		{
 			try{
 				$invoice = Invoice::with(['orders.user'])->findOrFail($invoiceId);
+				// A seller may download only their own invoices
+				if (Auth::user()->role === 'user' && (int) $invoice->user_id !== (int) Auth::id()) {
+					return $this->errorResponse('Invoice not found.', 404);
+				}
 				// Replace slashes to make a valid filename
 				$sanitizedNumber = str_replace('/', '-', $invoice->invoice_number);
 				$filename = 'invoice_' . $sanitizedNumber . '.xlsx';

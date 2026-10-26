@@ -24,7 +24,11 @@ class UserWebhookController extends Controller
     private function rules(): array
     {
         return [
-            'url'      => 'required|url|max:500',
+            'url'      => ['required', 'url', 'max:500', function ($attribute, $value, $fail) {
+                if (!\App\Support\PublicUrl::isSafe($value)) {
+                    $fail('The webhook URL must be a public http(s) address.');
+                }
+            }],
             'events'   => 'required|array|min:1',
             'events.*' => 'in:' . implode(',', array_keys(WebhookService::EVENTS)),
         ];

@@ -46,11 +46,23 @@ class ApplyRtoReturnCharge extends Command
 			return;
 		}
 
-		DB::beginTransaction();
-		try {
-			foreach ($eligibleOrders as $order) {
-				if ($order->user && $order->user->rateCard && $order->user->rateCard->is_rto_charge == 0) {
-					continue;
+		// One transaction per order: a bad order no longer rolls back (and blocks) all the others
+		foreach ($eligibleOrders as $candidate) {
+			if ($candidate->user && $candidate->user->rateCard && $candidate->user->rateCard->is_rto_charge == 0) {
+				continue;
+			}
+
+			try {
+			DB::transaction(function () use ($candidate) {
+				// Lock and re-check: the scheduler and UpdateOrderStatus can both run this for the same order
+				$order = Order::whereKey($candidate->id)->lockForUpdate()->first();
+				if (!$order || $order->rto_charge_applied) {
+					return;
+				}
+				$user = \App\Models\User::whereKey($order->user_id)->lockForUpdate()->first();
+				if (!$user) {
+					\Illuminate\Support\Facades\Log::warning('RTO charge skipped: order has no user', ['order_id' => $order->id]);
+					return;
 				}
 				$totalShippingCharge = (float) ($order->shipping_charge ?? 0);
 				$codCharge = (float) ($order->cod_charges ?? 0);
@@ -90,7 +102,7 @@ class ApplyRtoReturnCharge extends Command
 						'created_at'      => now(),
 						'updated_at'      => now()
 					]);
-					$order->user->decrement('wallet_amount', $rtoCharge);
+					$user->decrement('wallet_amount', $rtoCharge);
 				}
 
 				if ($codCharge > 0 && strtolower((string) ($order->order_type ?? '')) === 'cod') {
@@ -104,7 +116,7 @@ class ApplyRtoReturnCharge extends Command
 						'created_at'      => now(),
 						'updated_at'      => now()
 					]);
-					$order->user->increment('wallet_amount', $codCharge);
+					$user->increment('wallet_amount', $codCharge);
 				}
 
 				// Mark charge applied
@@ -115,12 +127,10 @@ class ApplyRtoReturnCharge extends Command
 				Helper::orderActivity($order->id, "RTO charges applied: ₹{$rtoCharge}");
 
 				$this->info("Applied RTO charge of ₹{$rtoCharge} for Order #{$order->id}");
+			});
+			} catch (\Throwable $e) {
+				$this->error("Order #{$candidate->id}: " . $e->getMessage());
 			}
-
-			DB::commit();
-		} catch (\Exception $e) {
-			DB::rollBack();
-			$this->error("Error: " . $e->getMessage());
 		}
 	}
 }

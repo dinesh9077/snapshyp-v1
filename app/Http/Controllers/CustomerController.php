@@ -295,7 +295,8 @@
 						];
 
 						if (!empty($request->id[$key])) {
-							CustomerAddress::whereId($request->id[$key])->update($addressData);
+							// Only addresses of this customer; another id must not touch someone else's address
+							CustomerAddress::whereId($request->id[$key])->where('customer_id', $id)->update($addressData);
 						} else {
 							$addressData['customer_id'] = $id;
 							$addressData['status'] = 1;

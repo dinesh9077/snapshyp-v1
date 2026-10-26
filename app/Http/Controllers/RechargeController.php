@@ -11,6 +11,7 @@ use App\Models\Order;
 use App\Models\CodWalletExpense;
 use App\Models\CodVoucher;
 use Illuminate\Support\Facades\Auth;
+use App\Support\CodBalance;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
@@ -37,46 +38,12 @@ class RechargeController extends Controller
 		if ($user->role === 'master_admin') {
 			return redirect()->route('home')->with('error', 'Master Admin does not have wallet access.');
 		}
-		$codBalance = 0;
-		$codTransferBalance = 0;
-		$walletTransferValue = 0;
-		$today = now();
-		if ($user->codPlan) {
-			$userPlanDays = (int)($user->codPlan->days + 1);
-			$thresholdDate = $today->copy()->subDays($userPlanDays)->format('Y-m-d');
-
-			$codBalance = Order::where('user_id', $user->id)
-				->where('is_remmitance', '0')
-				->where('order_type', 'cod')
-				->where('status_courier', 'delivered')
-				->whereDate('delivery_date', '<=', $thresholdDate)
-				->sum('cod_amount') ?? 0;
-
-			$lastPayoutDate = CodVoucher::where('user_id', $user->id)
-				->orderBy('voucher_date', 'desc')
-				->value('voucher_date') ?? 0;
-
-			$unsettledExpenses = CodWalletExpense::where('user_id', $user->id)
-				->whereDate('processed_at', '>', $lastPayoutDate)
-				->whereDate('processed_at', '<=', $today)
-				->where('status', 'completed')
-				->sum('cod_balance_used');
-
-			$codBalance = max(0, $codBalance - $unsettledExpenses);
-			$walletTransferValue = config('setting.cod_wallet_transfer_value', 0);
-			$codTransferBalance = $walletTransferValue > 0 ? ($codBalance * $walletTransferValue / 100) : $codBalance;
-		}
-
-		$codWalletBalance = SellerRemittance::where('user_id', $user->id)
-			->where('settlement_status', 'pending')
-			->sum('amount_transferred_to_seller');
-
-		$codWalletBalance += CodVoucher::where('user_id', $user->id)
-			->where('voucher_status', 0)
-			->sum('net_amount');
-
-		$codWalletBalance = max(0, $codWalletBalance);
-		$codRechargeAvailable = max(0, $codTransferBalance + $codWalletBalance);
+		$balances = CodBalance::for($user);
+		$codBalance = $balances['cod_balance'];
+		$codTransferBalance = $balances['transfer_balance'];
+		$walletTransferValue = $balances['transfer_percent'];
+		$codWalletBalance = $balances['pending_payouts'];
+		$codRechargeAvailable = $balances['available'];
 		$recentTransactions = UserWallet::where('user_id', $user->id)
 			->latest()
 			->limit(10)
@@ -90,10 +57,7 @@ class RechargeController extends Controller
 		try {
 			// Validate request using Validator facade
 			$validator = Validator::make($request->all(), [
-				'user_id' => 'required|exists:users,id',
 				'cod_amount' => 'required|numeric|min:0.01',
-				'cod_balance_percent' => 'required|numeric|min:0',
-				'cod_balance_amount' => 'required|numeric|min:0',
 				'payment_method' => 'required|in:cod',
 			]);
 
@@ -105,28 +69,26 @@ class RechargeController extends Controller
 				]);
 			}
 
-			$userId = $request->user_id;
 			$codAmount = (float) $request->cod_amount;
-			$codBalancePercent = $request->cod_balance_percent;
-			$codBalanceAmount = (float) $request->cod_balance_amount;
-			$codWalletAmount = (float) ($request->cod_wallet_amount ?? 0);
 
-			// Get user
-			$user = User::findOrFail($userId);
-
-			// Total available
-			$totalAvailable = $codBalanceAmount + $codWalletAmount;
+			// Always the logged-in seller's own COD, with balances computed on the server.
+			// The row lock makes a second simultaneous transfer wait and see the updated balance.
+			DB::beginTransaction();
+			$user = User::whereKey(Auth::id())->lockForUpdate()->firstOrFail();
+			$userId = $user->id;
+			$balances = CodBalance::for($user);
+			$codBalanceAmount = (float) $balances['transfer_balance'];
+			$codBalancePercent = $balances['transfer_percent'];
+			$totalAvailable = (float) $balances['available'];
 
 			// Check if requested amount exceeds available balance
 			if ($codAmount > ($totalAvailable + 0.01)) { // Small epsilon for float comparison
+				DB::rollBack();
 				return response()->json([
 					'status' => 'error',
 					'msg' => 'Insufficient COD balance. Available: ₹' . number_format($totalAvailable, 2)
 				]);
 			}
-
-			// Begin database transaction
-			DB::beginTransaction();
 
 			try {
 				// Generate unique reference ID
@@ -261,6 +223,9 @@ class RechargeController extends Controller
 				throw $e;
 			}
 		} catch (\Exception $e) {
+			if (DB::transactionLevel() > 0) {
+				DB::rollBack();
+			}
 			return response()->json([
 				'status' => 'error',
 				'msg' => 'Failed to process COD transfer: ' . $e->getMessage()
@@ -540,14 +505,26 @@ class RechargeController extends Controller
 		]);
 
 		$user = Auth::user();
+		// Approving recharges is an admin/staff action; sellers must never reach it
+		if ($user->role === 'user') {
+			abort(403);
+		}
+
 		// Hash::check returns true when plain text matches hashed password
 		if (!Hash::check($request->input('passkey'), $user->password)) {
 			return back()->with('error', 'Passkey does not match.');
 		}
 
-		$userWallet = UserWallet::with('user')->findOrFail($request->id);
 		try {
-			DB::transaction(function () use ($request, $userWallet) {
+			DB::transaction(function () use ($request) {
+				// Lock the row so a double click or repeated request can't credit twice
+				$userWallet = UserWallet::with('user')->lockForUpdate()->findOrFail($request->id);
+
+				// Only a pending recharge can change; a Paid one has already credited the wallet
+				if ($userWallet->transaction_status !== 'Pending') {
+					throw new \RuntimeException('This recharge is already ' . $userWallet->transaction_status . '.');
+				}
+
 				if ($request->status === "Pending") {
 					$userWallet->update(['transaction_status' => 'Pending']);
 				}
@@ -628,7 +605,8 @@ class RechargeController extends Controller
 			// Create Razorpay order
 			$orderData = [
 				'receipt' => 'wallet_' . $userId . '_' . time(),
-				'amount' => $amount * 100, // Convert to paise
+				// Razorpay needs whole paise: 200.10 * 100 is 20009.999… as a float
+				'amount' => (int) round((float) $amount * 100),
 				'currency' => 'INR',
 				'notes' => [
 					'user_id' => $userId,
@@ -711,21 +689,23 @@ class RechargeController extends Controller
 				], 400);
 			}
 
-			// Find user wallet record
+			// Begin transaction
+			DB::beginTransaction();
+
+			// Lock the wallet record so two verify calls for the same payment can't both credit
 			$userWallet = UserWallet::where('order_id', $request->razorpay_order_id)
 				->where('user_id', $request->user_id)
+				->lockForUpdate()
 				->firstOrFail();
 
 			// Check if already processed
 			if ($userWallet->transaction_status === 'Paid') {
+				DB::rollBack();
 				return response()->json([
 					'status' => 'error',
 					'msg' => 'Payment already processed'
 				], 400);
 			}
-
-			// Begin transaction
-			DB::beginTransaction();
 
 			try {
 				$user = User::findOrFail($request->user_id);
@@ -767,6 +747,9 @@ class RechargeController extends Controller
 				throw $e;
 			}
 		} catch (\Exception $e) {
+			if (DB::transactionLevel() > 0) {
+				DB::rollBack();
+			}
 			return response()->json([
 				'status' => 'error',
 				'msg' => 'Payment verification failed: ' . $e->getMessage()

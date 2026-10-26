@@ -590,6 +590,7 @@
     </div>
 
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    @include('embedded.partials.session-token')
     <script>
         var company_name = "{{ config('setting.company_name') }}";
         document.addEventListener('DOMContentLoaded', function() {

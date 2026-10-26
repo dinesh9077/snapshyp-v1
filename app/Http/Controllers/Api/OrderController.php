@@ -59,8 +59,23 @@ class OrderController extends Controller
 	protected $routxService;
 	protected $shadowfaxService;
 
+	// Endpoints that take an order id: the caller must own the order (same rule as the web panel)
+	private const OWNED_ORDER_METHODS = [
+		'orderDetails', 'orderEdit', 'orderUpdate', 'orderCancel', 'orderCancelApi',
+		'orderShipCharge', 'orderTrackingHistory', 'orderLableDownload',
+	];
+
 	public function __construct()
 	{
+		$this->middleware(function ($request, $next) {
+			$orderId = $request->route('id') ?? $request->route('orderId');
+			$order = $orderId !== null ? Order::find($orderId) : null;
+			if ($order && !$this->canAccessOrder(Auth::user(), $order)) {
+				return $this->errorResponse('Order not found', 404);
+			}
+			return $next($request);
+		})->only(self::OWNED_ORDER_METHODS);
+
 		$this->shipMozo = new ShipMozo();
 		$this->delhiveryService = new DelhiveryService();
 		$this->delhiveryB2CService = new DelhiveryB2CService();
@@ -802,6 +817,20 @@ class OrderController extends Controller
 		return;
 	}
 
+	// Same rule as the web panel's authorizeOrderAccess
+	private function canAccessOrder($user, Order $order): bool
+	{
+		if (!$user) {
+			return false;
+		}
+		if ($user->isMasterAdmin() || (int) $order->user_id === (int) $user->id) {
+			return true;
+		}
+
+		return in_array(strtolower((string) $user->role), ['admin', 'reseller', 'staff'], true)
+			&& User::where('id', $order->user_id)->where('staff_id', $user->id)->exists();
+	}
+
 	public function orderEdit($id)
 	{
 		$order = Order::with('orderItems')->find($id);
@@ -813,22 +842,30 @@ class OrderController extends Controller
 		$request->merge(['weight_order' => 1]); // Force B2C as B2B is disabled
 		DB::beginTransaction();
 		try {
-			$user_id = Auth::id();
-			$exclude = ['_token', 'product_name', 'product_category', 'sku_number', 'hsn_number', 'amount', 'quantity', 'order_image', 'invoice_document', 'first_name', 'last_name', 'email', 'gst_number', 'mobile', 'address', 'country', 'state', 'city', 'zip_code'];
-			if ($request->weight_order == 2) {
-				$exclude = array_merge($exclude, ['weight', 'length', 'width', 'height']);
+			// Ownership is checked by the constructor middleware; the order stays with its seller
+			$order = Order::findOrFail($id);
+			$user_id = $order->user_id;
+
+			// Charges, AWB, remittance etc. are set by shipping; once shipped the order is locked
+			if (strtolower((string) $order->status_courier) !== 'new') {
+				DB::rollBack();
+				return $this->errorResponse('Only new orders can be edited.');
 			}
+
 			if (empty($request->reference_number)) {
+				DB::rollBack();
 				return $this->errorResponse('Reference number is required.');
 			}
 
 			if (Order::where('user_id', $user_id)->where('reference_number', $request->reference_number)->where('id', '!=', $id)->exists()) {
+				DB::rollBack();
 				return $this->errorResponse('This reference number already used');
 			}
 
-			$data = $request->except($exclude);
-
-			$order = Order::findOrFail($id);
+			// Only the editable order fields; never charges, status, AWB, owner or order number
+			$fields = ['reference_number', 'order_date', 'order_type', 'cod_amount', 'warehouse_id', 'customer_id', 'customer_address_id',
+				'invoice_no', 'invoice_amount', 'ewaybillno', 'dimension_type', 'insurance_type', 'weight_order', 'length', 'width', 'height'];
+			$data = $request->only($fields);
 
 			// $order->customer()->update([
 			// 	'user_id'    => $user_id,
@@ -854,7 +891,6 @@ class OrderController extends Controller
 			// 	]);
 			// }
 
-			$data['user_id'] = $user_id;
 			$data['is_fragile_item'] = $request->is_fragile_item ?? 0;
 			$data['weight'] = $request->total_weight ?? $order->weight;
 			$data['total_amount'] = $request->invoice_amount ?? $order->total_amount;
@@ -1159,6 +1195,8 @@ class OrderController extends Controller
 			if (!$isQueuedCancellation && $user->role == "user") {
 				$walletRefund = $order->shipping_charge ?? 0;
 				$user->increment('wallet_amount', $walletRefund);
+				// Take back franchise earning / creator margin paid for this shipment
+				app(\App\Services\ShipmentProcessor::class)->reverseShippingCredits($order);
 
 				Billing::create([
 					'user_id' => $order->user_id,
@@ -1316,6 +1354,7 @@ class OrderController extends Controller
 		try {
 			$requestData = $request->all();
 			$requestData['is_bulk_shipment'] = 0;
+			$requestData['actor_user_id'] = auth()->id();
 			$response = $this->shipmentProcessor->orderShipNow($requestData);
 
 			if (

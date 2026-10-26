@@ -481,7 +481,6 @@
                             window.location.href = "{{ route('login') }}";
                         }, 1000)
                     } else if (res.status == "mail") {
-                        localStorage.setItem('generatedOtp', res.uuid);
                         showOtpAlert(
                             res.msg,
                             "info",
@@ -524,17 +523,11 @@
 
             // Disable submit button to prevent multiple submissions
             $otpForm.find(':submit').prop('disabled', true);
-            const generatedOtp = localStorage.getItem('generatedOtp');
 
-            if (!generatedOtp) {
-                toastrMsg("error", "Something went wrong. Please try again.");
-                return;
-            }
-
-            // Create FormData object
+            // The server looks the OTP up by email; the browser never holds it
             var formData = new FormData(this);
             formData.append('_token', "{{ csrf_token() }}"); // Use meta tag for CSRF token
-            formData.append('generatedOtp', generatedOtp); // Use meta tag for CSRF token
+            formData.append('email', $signupForm.find('#email').val() || '');
 
             $.ajax({
                 type: $otpForm.attr('method'),
@@ -591,7 +584,6 @@
                 contentType: false, // Necessary for FormData
                 dataType: 'json',
                 success: function(res) {
-                    localStorage.setItem('generatedOtp', res.uuid);
                     $resendOtp.prop('disabled', false).html('Resend OTP');
 
                     if (res.status === "mail") {

@@ -8,6 +8,12 @@ use Illuminate\Support\Facades\Validator;
 
 class CodSettingController extends Controller
 {
+    // Admin-only screens; routes add the specific permission
+    public function __construct()
+    {
+        $this->middleware('auth');
+    }
+
     /**
      * Display a listing of the resource.
      */

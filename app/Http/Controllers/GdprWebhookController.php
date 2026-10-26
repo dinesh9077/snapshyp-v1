@@ -106,6 +106,6 @@ class GdprWebhookController extends Controller
         );
 
         // 5. Timing-safe comparison
-        return hash_equals($hmacHeader, $calculatedHmac);
+        return hash_equals($calculatedHmac, (string) $hmacHeader);
     }
 }

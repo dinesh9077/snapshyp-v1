@@ -50,7 +50,9 @@ class RouteServiceProvider extends ServiceProvider
     protected function configureRateLimiting()
     {
         RateLimiter::for('api', function (Request $request) {
-            return Limit::perMinute(60);
+            // One bucket per client (API token, else IP); without by() every client shared one bucket
+            $token = $request->bearerToken() ?: $request->header('X-API-Token') ?: $request->header('api-token');
+            return Limit::perMinute(60)->by($token ? 'token:' . sha1($token) : 'ip:' . $request->ip());
         });
     }
 }

@@ -164,7 +164,12 @@
 					$q->with('user:id,name')->orderBy('id');
 				}])->findOrFail($id);
 
-				return $this->successResponse($ticket , 'ticket fetched successfully.'); 
+				// A seller sees only their own tickets
+				if (Auth::user()->role === 'user' && (int) $ticket->user_id !== (int) Auth::id()) {
+					return $this->errorResponse('Ticket not found.', 404);
+				}
+
+				return $this->successResponse($ticket , 'ticket fetched successfully.');
 			} catch (\Exception $e) {
 				return $this->errorResponse('Something went wrong.');  
 			}

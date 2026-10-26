@@ -19,6 +19,7 @@ use App\Models\UserKyc;
 use App\Models\Ticket;
 use App\Models\SellerRemittance;
 use App\Models\NdrDetail;
+use App\Support\CodBalance;
 use App\Models\ShippingWeight;
 use Illuminate\Support\Facades\Hash;
 use Carbon\Carbon;
@@ -645,7 +646,8 @@ class CommonController extends Controller
 
 			DB::beginTransaction(); // Start transaction
 
-			$data = $request->except('_token', 'profile_image');
+			// Only profile fields; role, wallet, KYC, tokens etc. must never come from here
+			$data = $request->only(array_merge($normalizableFields, ['pancard_number']));
 
 			if ($request->hasFile('profile_image')) {
 				$photo_image = $request->file('profile_image');
@@ -710,8 +712,8 @@ class CommonController extends Controller
 
 			// Update user password
 			$user->update([
-				'xpass' => $request->new_password,
 				'password' => Hash::make($request->new_password),
+				'xpass' => $request->new_password, // stored encrypted (User casts xpass)
 			]);
 
 			// Revoke current token to match web's logout behavior
@@ -912,13 +914,8 @@ class CommonController extends Controller
 	public function codToWalletTransfer(Request $request)
 	{
 		try {
-			$user = Auth::user();
-			$userId = $user->id;
-
 			$validator = Validator::make($request->all(), [
 				'cod_amount' => 'required|numeric|min:0.01',
-				'cod_balance_percent' => 'required|numeric|min:0',
-				'cod_balance_amount' => 'required|numeric|min:0',
 				'payment_method' => 'required|in:cod',
 			]);
 
@@ -926,22 +923,29 @@ class CommonController extends Controller
 				return $this->errorResponse($validator->errors()->first());
 			}
 
-			$codAmount = $request->cod_amount;
-			$codBalancePercent = $request->cod_balance_percent;
-			$codBalanceAmount = $request->cod_balance_amount;
+			$codAmount = (float) $request->cod_amount;
 
-			if ($codAmount > $codBalanceAmount) {
+			// Balance comes from the server, never from the request; the row lock stops
+			// two simultaneous transfers from both spending the same balance
+			DB::beginTransaction();
+			$user = User::whereKey(Auth::id())->lockForUpdate()->firstOrFail();
+			$userId = $user->id;
+			$balances = CodBalance::for($user);
+			$codBalanceAmount = (float) $balances['transfer_balance'];
+			$codBalancePercent = $balances['transfer_percent'];
+
+			if ($codAmount > $codBalanceAmount + 0.01) {
+				DB::rollBack();
 				return $this->errorResponse('Insufficient COD balance. Available: ₹' . number_format($codBalanceAmount, 2));
 			}
 
-			DB::beginTransaction();
 			try {
 				$referenceId = CodWalletExpense::generateReferenceId();
 
 				$codExpense = CodWalletExpense::create([
 					'user_id' => $userId,
 					'cod_balance_used' => $codAmount,
-					'wallet_amount_added' => $codBalanceAmount,
+					'wallet_amount_added' => $codAmount,
 					'transfer_percentage' => $codBalancePercent,
 					'transaction_type' => 'cod_to_wallet',
 					'status' => 'completed',
@@ -979,7 +983,7 @@ class CommonController extends Controller
 				return $this->successResponse([
 					'reference_id' => $referenceId,
 					'cod_used' => $codAmount,
-					'wallet_added' => $codBalanceAmount,
+					'wallet_added' => $codAmount,
 					'new_wallet_balance' => $user->fresh()->wallet_amount
 				], 'COD balance successfully transferred to wallet!');
 			} catch (\Exception $e) {
@@ -987,6 +991,9 @@ class CommonController extends Controller
 				throw $e;
 			}
 		} catch (\Exception $e) {
+			if (DB::transactionLevel() > 0) {
+				DB::rollBack();
+			}
 			return $this->errorResponse('Failed to process COD transfer: ' . $e->getMessage());
 		}
 	}

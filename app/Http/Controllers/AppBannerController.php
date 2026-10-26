@@ -7,6 +7,12 @@ use Illuminate\Http\Request;
 
 class AppBannerController extends Controller
 {
+    // Admin-only screens; routes add the specific permission
+    public function __construct()
+    {
+        $this->middleware('auth');
+    }
+
     public function index()
     {
         $banners = AppBanner::all();

@@ -41,6 +41,11 @@ class CheckApiToken
             return $this->errorResponse('Invalid API token', 401);
         }
 
+        // A deactivated seller must lose API access too
+        if ((int) $user->status !== 1) {
+            return $this->errorResponse('Account is inactive', 403);
+        }
+
         // Set the authenticated user for later use
         $request->merge(['user_id' => $user->id]);
 

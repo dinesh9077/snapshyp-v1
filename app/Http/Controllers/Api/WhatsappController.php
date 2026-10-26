@@ -188,10 +188,11 @@ class WhatsappController extends Controller
             'fromNumber' => $fromNumber,
             'customer_name' => $customer_name,
         ];
-        $encoded = urlencode(base64_encode(json_encode($dataPayload)));
+        // base64url so the value survives the query string unchanged
+        $encoded = rtrim(strtr(base64_encode(json_encode($dataPayload)), '+/', '-_'), '=');
 
-        // ✅ Build edit link
-        $editLink = url('edit-address') . "?data={$encoded}";
+        // Signed link: the address id inside can't be swapped for someone else's
+        $editLink = \Illuminate\Support\Facades\URL::temporarySignedRoute('address.edit', now()->addDays(7), ['data' => $encoded]);
 
         // ✅ WhatsApp message
         $message = "Address Confirmation! 🏠\n\n"

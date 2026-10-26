@@ -24,7 +24,7 @@ class WoocommerceController extends Controller
             $payload = $request->all();
 
             Log::info('WooCommerce order created', [
-                'payload' => $payload,
+                'payload' => \Illuminate\Support\Arr::except($payload, ['api_key']),
             ]);
 
             // Extract order data from WooCommerce webhook
@@ -46,7 +46,7 @@ class WoocommerceController extends Controller
             if (!$apiKey) {
                 DB::rollBack();
                 Log::error('WooCommerce webhook missing API key', [
-                    'payload' => $payload,
+                    'payload' => \Illuminate\Support\Arr::except($payload, ['api_key']),
                     'headers' => $request->headers->all()
                 ]);
 
@@ -62,7 +62,7 @@ class WoocommerceController extends Controller
             if (!$user) {
                 DB::rollBack();
                 Log::error('WooCommerce webhook invalid API key', [
-                    'api_key' => $apiKey
+                    'api_key' => substr((string) $apiKey, 0, 4) . '…'
                 ]);
 
                 return response()->json([
@@ -78,7 +78,7 @@ class WoocommerceController extends Controller
             ]);
 
             // Check if order already exists
-            $existingOrder = Order::where('woocommerce_order_id', $wooOrderId)->first();
+            $existingOrder = Order::where('woocommerce_order_id', $wooOrderId)->where('user_id', $user->id)->first();
             if ($existingOrder) {
                 DB::rollBack();
                 return response()->json([
@@ -299,7 +299,7 @@ class WoocommerceController extends Controller
             $payload = $request->all();
 
             Log::info('WooCommerce order cancelled webhook received', [
-                'payload' => $payload,
+                'payload' => \Illuminate\Support\Arr::except($payload, ['api_key']),
             ]);
 
             // Get order ID
@@ -334,7 +334,7 @@ class WoocommerceController extends Controller
             }
 
             // Find the order
-            $order = Order::where('woocommerce_order_id', $wooOrderId)->first();
+            $order = Order::where('woocommerce_order_id', $wooOrderId)->where('user_id', $user->id)->first();
 
             if (!$order) {
                 Log::warning('WooCommerce order not found for cancellation', [

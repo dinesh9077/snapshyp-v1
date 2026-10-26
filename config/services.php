@@ -39,4 +39,14 @@ return [
     "shopify_api_scopes" => env('SHOPIFY_API_SCOPES', 'read_orders,write_orders,read_fulfillments,write_fulfillments,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders,read_locations,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,write_third_party_fulfillment_orders,read_products'),
     "shopify_api_version" => env('SHOPIFY_API_VERSION', '2025-10'),
 
+    // Shared secret for courier status webhooks (?token=... in the URL registered with each courier)
+    "courier_webhook_secret" => env('COURIER_WEBHOOK_SECRET'),
+
+    // Wallet recharge payment gateway (MasterService)
+    'recharge_gateway' => [
+        'url' => env('RECHARGE_GATEWAY_URL', 'https://api.recharge.kashishindiapvtltd.com/payments'),
+        'secret' => env('RECHARGE_GATEWAY_SECRET'),
+        'user' => env('RECHARGE_GATEWAY_USER'),
+    ],
+
 ];

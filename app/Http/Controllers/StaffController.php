@@ -20,6 +20,13 @@ class StaffController extends Controller
 	public function __construct()
 	{
 		$this->middleware('auth');
+		// Staff and roles are managed by admins and franchises, never by sellers
+		$this->middleware(function ($request, $next) {
+			if (auth()->user()->role === 'user') {
+				abort(403);
+			}
+			return $next($request);
+		});
 		$this->masterService = new MasterService();
 	}
 
@@ -577,7 +584,7 @@ class StaffController extends Controller
 
 			$data['shipping_api_provider'] = null;
 			$data['password'] = Hash::make($request->password);
-			$data['xpass'] = $request->password;
+			$data['xpass'] = $request->password; // stored encrypted (User casts xpass)
 			$data['email'] = strtolower($request->email);
 			$data['staff_id'] = $admin->id;
 			$data['created_at'] = $currentTimestamp;
@@ -695,17 +702,27 @@ class StaffController extends Controller
 			$staff = User::findOrFail($staffId);
 			$authUser = auth()->user();
 			if (!$this->canManageStaffMember($authUser, $staff)) {
+				DB::rollBack();
 				return response()->json([
 					'status' => 'error',
 					'msg' => 'You are not allowed to update this staff member.'
 				]);
 			}
 
+			// Same rule as staffStore: only privileged users may hand out admin roles
+			if (in_array($request->role, ['admin', 'master_admin'], true) && !$this->canManagePrivilegedRoles($authUser)) {
+				DB::rollBack();
+				return response()->json([
+					'status' => 'error',
+					'msg' => 'You are not allowed to assign this role.'
+				]);
+			}
+
 			$admin = auth()->user();
 			$currentTimestamp = Carbon::now();
 
-			// Update only the fields provided in the request
-			$data = $request->except('_token', 'password');
+			// Update only the fields provided in the request; wallet and tokens never come from here
+			$data = $request->except('_token', 'password', 'wallet_amount', 'api_token', 'xpass');
 			$b2cRateCardId = (int) $request->input('b2c_rate_card_id', 0);
 			$b2bRateCardId = (int) $request->input('b2b_rate_card_id', 0);
 
@@ -729,7 +746,7 @@ class StaffController extends Controller
 		
 			if ($request->filled('password')) {
 				$data['password'] = Hash::make($request->password); // Hash the new password if provided
-				$data['xpass'] = $request->password; // Save clear text password
+				$data['xpass'] = $request->password; // stored encrypted (User casts xpass)
 			}
 			$data['email'] = strtolower($request->email);
 			$data['staff_id'] = $admin->id;

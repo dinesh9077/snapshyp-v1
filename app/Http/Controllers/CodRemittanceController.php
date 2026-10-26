@@ -49,8 +49,22 @@ class CodRemittanceController extends Controller
     /**
      * AJAX handler for users list DataTable
      */
+    // A seller sees only their own remittance data (same rule as show())
+    private function abortUnlessOwnRemittance($userId): void
+    {
+        $authUser = app('authUser');
+        if ($authUser->role === 'user' && (int) $authUser->id !== (int) $userId) {
+            abort(403, 'Unauthorized access');
+        }
+    }
+
     public function usersListAjax(Request $request)
     {
+        // Same rule as usersList(): the all-sellers list is for admin/staff
+        if (app('authUser')->role === 'user') {
+            abort(403, 'Unauthorized access');
+        }
+
         $draw = $request->get('draw');
         $start = $request->get('start');
         $length = $request->get('length');
@@ -227,6 +241,7 @@ class CodRemittanceController extends Controller
 
     public function userRemittanceAjax(Request $request, $userId)
     {
+        $this->abortUnlessOwnRemittance($userId);
         $draw = $request->get('draw');
         $start = $request->get('start');
         $length = $request->get('length');
@@ -474,6 +489,7 @@ class CodRemittanceController extends Controller
     public function remittanceOrdersAjax(Request $request, $id)
     {
         $remittance = SellerRemittance::with('orders')->findOrFail($id);
+        $this->abortUnlessOwnRemittance($remittance->user_id);
 
         $draw = $request->get('draw');
         $start = $request->get('start');
@@ -622,6 +638,7 @@ class CodRemittanceController extends Controller
         $order = Order::where('id', $orderId)
             ->orWhere('order_prefix', $orderId)
             ->firstOrFail();
+        $this->abortUnlessOwnRemittance($order->user_id);
 
         // Get all transactions for this order (COD, Service Fee, etc.)
         $transactions = [];
@@ -674,6 +691,7 @@ class CodRemittanceController extends Controller
     public function exportExcel(Request $request, $id)
     {
         $remittance = SellerRemittance::findOrFail($id);
+        $this->abortUnlessOwnRemittance($remittance->user_id);
         $tab = $request->get('tab', 'cod');
 
         $fileName = 'remittance_' . $remittance->remittance_id . '_' . date('Y-m-d') . '.xlsx';

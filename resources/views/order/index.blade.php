@@ -262,6 +262,11 @@ td p {
         transform: rotate(360deg);
     }
 }
+.btn-info-tip {
+    margin-left: 4px;
+    opacity: 0.7;
+    cursor: help;
+}
 </style>
 <div class="content-page">
     <div class="content">
@@ -272,6 +277,7 @@ td p {
                         @if (!in_array($status, ['All', 'New']))
                         <button id="downloadAllLable" class="btn-main-1" style="display:none;">
                             <i class="mdi mdi-file-download-outline me-1"></i> Bulk Label
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Download the shipping labels of all selected orders together."></i>
                         </button>
                         @endif
 
@@ -279,39 +285,48 @@ td p {
                         @if ($status === 'New')
                         <button id="bulkUpdateOrder" class="btn-main-1" style="display:none;">
                             <i class="mdi mdi-playlist-edit me-1"></i> Bulk Update
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Set the warehouse, weight and package size (L × W × H) for all selected orders at once."></i>
                         </button>
 
                         <button id="bulkSyncChannel" class="btn-main-1" style="display:none;">
                             <i class="mdi mdi-sync me-1"></i> Sync Channel
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Checks the selected Shopify orders on Shopify. Orders already fulfilled on Shopify are removed from this list."></i>
                         </button>
 
                         <button id="bulkShipmentOrder" class="btn-main-1" style="display:none;">
                             <i class="mdi mdi-truck me-1"></i> Bulk Ship Now
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Book shipments for all selected orders with the courier and mode (Surface/Air) you choose. Runs in the background."></i>
                         </button>
                         @endif
 
                         <button id="bulkShipmentCancel" class="btn-main-1" style="display:none;">
                             <i class="mdi mdi-close-circle-outline me-1"></i> Bulk Cancel
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Cancel the selected orders, or their shipments if already booked. You can also cancel them on the sales channel."></i>
                         </button>
                         @if ($status === 'Ready To Ship')
                         <button id="bulkSchedulePickup" class="btn-main-1" style="display:none;">
                             <i class="mdi mdi-calendar-clock me-1"></i> Schedule Pickup
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Request a courier pickup for the selected Delhivery or ShipMozo shipments."></i>
                         </button>
                         @endif
                         @endif
 
                         @if(in_array(auth()->user()->role, ['user', 'master_admin', 'franchise']) || config('permission.admin_dashboard.view'))
                         <a href="{{ route('order.create') }}?weight_order=1">
-                            <button class="btn-main-1"> + Add Order </button>
+                            <button class="btn-main-1"> + Add Order
+                                <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Create a new order manually."></i>
+                            </button>
                         </a>
                         @endif
 
                         <button type="button" class="btn-main-1" id="orderExportExcel">
                             <i class="mdi mdi-file-excel-outline me-1"></i> Export
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Download the orders in this tab as an Excel file, using the current filters and search."></i>
                         </button>
 
                         <button type="button" class="btn-main-1 search-btn-remi" id="orderFilterModal">
                             Filter <i class="mdi mdi-filter-outline"></i>
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Narrow the list by date, customer, warehouse, payment type, weight, state/city and more."></i>
                         </button>
                     </div>
                     <div class="inner-page-heading order-tab mb-2 mt-3">
@@ -1114,7 +1129,7 @@ $(document).ready(function() {
                 }
             },
             error: function(xhr) {
-                toastrMsg("error", "Something went wrong. Please try again.");
+                toastrMsg("error", xhr.responseJSON?.msg || "Something went wrong. Please try again.");
                 stopLoading($submitButton);
             }
         });
@@ -1188,7 +1203,7 @@ $(document).ready(function() {
                 // ✅ Error also means stop warning
                 window.removeEventListener("beforeunload", lbhBeforeUnloadHandler);
 
-                toastrMsg("error", "Something went wrong. Please try again.");
+                toastrMsg("error", xhr.responseJSON?.msg || "Something went wrong. Please try again.");
                 stopLoading($submitButton);
             }
         });
@@ -1320,6 +1335,8 @@ $(document).ready(function() {
             },
             columns: columns,
             drawCallback: function() {
+                // Rows are re-rendered unchecked, so reset the master checkbox and bulk buttons
+                $('#checkAll').prop('checked', false).trigger('change');
                 $('[data-toggle="tooltip"]').tooltip();
                 $('[data-fancybox="images"]').fancybox({
                     loop: true
@@ -1330,7 +1347,8 @@ $(document).ready(function() {
 
     // Define table columns
     let OrderColumns = [
-        { data: 'id', name: 'id', orderable: true },
+        // Checkbox column: not orderable, so clicking #checkAll doesn't re-sort and clear row checkboxes
+        { data: 'id', name: 'id', orderable: false },
         { data: 'order_id', name: 'order_id', orderable: false },
         { data: 'seller_details', name: 'seller_details', orderable: false },
         { data: 'customer_details', name: 'customer_details', orderable: false }
@@ -1365,6 +1383,9 @@ $(document).ready(function() {
         status_courier: statusCourier,
         shippingCompanyId: shippingCompanyId
     }, OrderColumns);
+
+    // Filters from the Filter modal, so Export matches what the table shows
+    let activeOrderFilters = {};
 
     $('#applyOrderFilters').on('click', function(e) {
         e.preventDefault();
@@ -1416,6 +1437,8 @@ $(document).ready(function() {
                 .val(),
         };
 
+        activeOrderFilters = filters;
+
         let tableId = '#neworder_datatable';
         let tableKey = 'new';
 
@@ -1449,6 +1472,8 @@ $(document).ready(function() {
             status_courier: statusCourier,
         };
 
+        activeOrderFilters = {};
+
         let tableId = '#neworder_datatable';
         let tableKey = 'new';
         // 🔹 Initialize once, reload after
@@ -1475,6 +1500,7 @@ $(document).ready(function() {
             is_portal_order: is_portal_order,
             is_wordpress_order: is_wordpress_order,
             status_courier: statusCourier,
+            ...activeOrderFilters,
             search: searchText
         };
 
@@ -1498,6 +1524,13 @@ $(document).ready(function() {
 });
 //Order End Listing
 
+// State-changing actions go as POST with the CSRF token (a GET link could be triggered from another site)
+function postTo(url) {
+    var form = $('<form>', { method: 'POST', action: url })
+        .append($('<input>', { type: 'hidden', name: '_token', value: "{{ csrf_token() }}" }));
+    form.appendTo('body').trigger('submit');
+}
+
 function cancelNewOrder(obj, e) {
     e.preventDefault();
     let orderPrefix = $(obj).attr('data-order_prefix') || '';
@@ -1520,7 +1553,7 @@ function cancelNewOrder(obj, e) {
             if (isChecked) {
                 url += "&cancel_on_channel=1";
             }
-            location.href = url;
+            postTo(url);
         }
     })
 }
@@ -1537,7 +1570,7 @@ function deleteOrder(obj, e) {
         confirmButtonText: "Yes, Delete!"
     }).then(function(t) {
         if (t.value) {
-            location.href = obj;
+            postTo($(obj).attr('href'));
         }
     })
 }
@@ -1564,7 +1597,7 @@ function cancelOrderApi(obj, e) {
             if (isChecked) {
                 url += "&cancel_on_channel=1";
             }
-            location.href = url;
+            postTo(url);
         }
     })
 }
@@ -1667,10 +1700,17 @@ $(document).ready(function() {
     $('#bulkSyncChannel').hide();
     $('#bulkSchedulePickup').hide();
 
+    // Info icons only show a tooltip; clicking them must not trigger the button or link
+    $('.btn-info-tip').tooltip().on('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+    });
+
     // Master Checkbox Click Event
     $('#checkAll').on('change', function() {
         let isChecked = $(this).prop('checked');
-        $(".order-checkbox").prop('checked', isChecked);
+        // Skip disabled checkboxes (orders still processing in the queue)
+        $(".order-checkbox:not(:disabled)").prop('checked', isChecked);
         $('#downloadAllLable').toggle(isChecked);
         $('#bulkShipmentOrder').toggle(isChecked);
         $('#bulkUpdateOrder').toggle(isChecked);
@@ -1681,7 +1721,7 @@ $(document).ready(function() {
 
     // Individual Checkbox Click Event
     $(document).on('change', '.order-checkbox', function() {
-        let totalCheckboxes = $('.order-checkbox').length;
+        let totalCheckboxes = $('.order-checkbox:not(:disabled)').length;
         let checkedCheckboxes = $('.order-checkbox:checked').length;
 
         $('#checkAll').prop('checked', totalCheckboxes === checkedCheckboxes);

@@ -238,8 +238,8 @@ class UserController extends Controller
 			$data['b2b_rate_card_id'] = (int) $request->input('b2b_rate_card_id', 0);
 			$data['rate_card_id'] = $data['b2c_rate_card_id'];
 
-		$data['xpass'] = $request->password;
 		$data['password'] = Hash::make($request->password);
+		$data['xpass'] = $request->password; // stored encrypted (User casts xpass)
 		$data['api_token'] = $this->generateUniqueToken();
 		$data['role'] = 'user';
 		$data['staff_id'] = $staffId;
@@ -328,6 +328,11 @@ class UserController extends Controller
 		$authUser = Auth::user();
 		$canManageCharges = $authUser->isMasterAdmin();
 		$data = $request->except('_token', 'password');
+		// Wallet changes go through recharge/offline; only the master admin may change a role
+		unset($data['wallet_amount'], $data['api_token'], $data['xpass']);
+		if (!$authUser->isMasterAdmin()) {
+			unset($data['role']);
+		}
 		// Franchise cannot assign rate cards to its sellers.
 		// Keep seller's rate card unset so it inherits from the parent franchise.
 
@@ -348,8 +353,8 @@ class UserController extends Controller
 
 		// If a password is provided, hash it and store it
 		if (!empty($request->password)) {
-			$data['xpass'] = $request->password;
 			$data['password'] = Hash::make($request->password);
+			$data['xpass'] = $request->password; // stored encrypted (User casts xpass)
 		}
 		$data['updated_at'] = now();
 
@@ -374,7 +379,11 @@ class UserController extends Controller
 			}
 
 			// Update user data
-			$user = User::find($userId);
+			$user = User::findOrFail($userId);
+			if (!$this->canManageAccount($authUser, $user)) {
+				DB::rollBack();
+				return response()->json(['status' => 'error', 'msg' => 'You are not allowed to update this user.'], 403);
+			}
 			$user->update($data);
 			$this->ensureUserKycRecord($user);
 
@@ -389,12 +398,22 @@ class UserController extends Controller
 		}
 	}
 
+	// Only the master admin may change admin/master_admin accounts
+	private function canManageAccount($authUser, User $target): bool
+	{
+		return $authUser->isMasterAdmin() || !in_array($target->role, ['admin', 'master_admin'], true);
+	}
+
 	public function deleteUser(Request $request, $userId)
 	{
+		$target = User::findOrFail($userId);
+		if (!$this->canManageAccount(Auth::user(), $target)) {
+			abort(403);
+		}
+
 		DB::beginTransaction();
 		try {
-
-			User::find($userId)->delete();
+			$target->delete();
 			DB::commit();
 
 			// Prefer going back to the list page the action came from (approved/pending).
@@ -432,6 +451,11 @@ class UserController extends Controller
 		]);
 
 		$user = Auth::user();
+		// Manual wallet credit/debit is an admin/staff action; sellers must never reach it
+		if ($user->role === 'user') {
+			abort(403);
+		}
+
 		// Hash::check returns true when plain text matches hashed password
 		if (!Hash::check($request->input('passkey'), $user->password)) {
 			return back()->with('error', 'Passkey does not match.');

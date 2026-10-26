@@ -62,8 +62,10 @@ class UpdateOrderStatus extends Command
 		->whereIn('status_courier', $statusCourierMap)
 		->whereNotNull('awb_number')
 		->where('awb_number', '!=', '')
-		->select(['id', 'status_courier', 'awb_number', 'lr_no', 'shipping_company_id', 'user_id'])
-		->chunk(50, function ($orders) use ($today, &$processedCount, &$updatedCount, &$statusMappings) {
+		// send_whatsapp_notify is needed for the "already notified" check (else messages repeat)
+		->select(['id', 'status_courier', 'awb_number', 'lr_no', 'shipping_company_id', 'user_id', 'send_whatsapp_notify'])
+		// chunkById pages by id: chunk() pages by offset and skips rows once status_courier is updated
+		->chunkById(50, function ($orders) use ($today, &$processedCount, &$updatedCount, &$statusMappings) {
 			
 			// Group orders by shipping company to optimize API calls
 			$ordersByCompany = $orders->groupBy('shipping_company_id'); 

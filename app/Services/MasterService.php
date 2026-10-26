@@ -62,17 +62,17 @@
 		public function rechargeOrderCreate($amount)
 		{
 			try {
-				$orderAmount = $amount * 100; // Razorpay usually expects paise
-				$orderUrl = "https://api.recharge.kashishindiapvtltd.com/payments/create-order-gateway";
+				$orderAmount = (int) round((float) $amount * 100); // whole paise (avoid float 20009.999…)
+				$orderUrl = config('services.recharge_gateway.url') . '/create-order-gateway';
 
-				$response = Http::withOptions(['verify' => false])
+				$response = Http::withOptions(['verify' => true])
 				->withHeaders([
 					'Accept'       => 'application/json',
 					'Content-Type' => 'application/json',
 				])
 				->post($orderUrl, [
-					"secret_key" => "kashishindiapvtltdgatewaywithrznew",
-					"user"       => "8c816dcb-766b-4c7c-bbc3-831b494966fe",
+					"secret_key" => config('services.recharge_gateway.secret'),
+					"user"       => config('services.recharge_gateway.user'),
 					"amount"     => $orderAmount,
 				]);
 
@@ -100,16 +100,16 @@
 		public function getRechargeStatus($orderId)
 		{
 			try {
-				$orderUrl = "https://api.recharge.kashishindiapvtltd.com/payments/check-payment-gateway";
+				$orderUrl = config('services.recharge_gateway.url') . '/check-payment-gateway';
 
-				$response = Http::withOptions(['verify' => false])
+				$response = Http::withOptions(['verify' => true])
 					->withHeaders([
 						'Accept' => 'application/json',
 						'Content-Type' => 'application/json',
 					])
 					->post($orderUrl, [
-						"secret_key" => "kashishindiapvtltdgatewaywithrznew",
-						"user" => "8c816dcb-766b-4c7c-bbc3-831b494966fe",
+						"secret_key" => config('services.recharge_gateway.secret'),
+						"user" => config('services.recharge_gateway.user'),
 						"id" => $orderId,
 					]);
 

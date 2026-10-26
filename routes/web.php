@@ -40,28 +40,28 @@ Route::match (
 ['post'],
 	'/delhivery/webhook',
 [WebhookController::class , 'delhiveryWebhook']
-);
+)->middleware('courier.webhook');
 
 // UrbaneBolt Status Update Webhook
 Route::match (
 ['post'],
 	'/urbanebolt/webhook',
 [WebhookController::class , 'urbaneboltWebhook']
-);
+)->middleware('courier.webhook');
 
 // Shipmozo Status Update Webhook
 Route::match (
 ['post'],
 	'/shipmozo/webhook',
 [WebhookController::class , 'shipmozoWebhook']
-);
+)->middleware('courier.webhook');
 
 // Shadowfax Status Update Webhook
 Route::match (
 ['post'],
 	'/shadowfax/webhook',
 [WebhookController::class , 'shadowfaxWebhook']
-);
+)->middleware('courier.webhook');
 
 // Shopify App Landing Route (after installation completes)
 Route::get('/shopify', [ShopifyController::class , 'home'])
@@ -90,7 +90,7 @@ Route::get('/shopify/login', [ShopifyController::class , 'showLogin'])
 
 Route::post('/shopify/login', [ShopifyController::class , 'postLogin'])
 	->name('shopify.embedded.login.post')
-	->middleware(['shopifyCsp']);
+	->middleware(['shopifyCsp', 'throttle:10,1']);
 
 Route::get('/shopify/register', [ShopifyController::class , 'showRegister'])
 	->name('shopify.embedded.register')
@@ -98,7 +98,7 @@ Route::get('/shopify/register', [ShopifyController::class , 'showRegister'])
 
 Route::post('/shopify/register', [ShopifyController::class , 'postRegister'])
 	->name('shopify.embedded.register.post')
-	->middleware(['shopifyCsp']);
+	->middleware(['shopifyCsp', 'throttle:10,1']);
 
 // Main embedded app home (loaded via AppBridge)
 Route::get('/apps/home', [ShopifyController::class , 'index'])
@@ -162,26 +162,26 @@ Route::get('/api/get-sync-mode', [ShopifyController::class , 'getSyncMode'])
 	->name('shopify.sync.get')
 	->middleware(['shopifyCsp', 'shopify.embedded.auth']);
 
-Route::get('edit-address', [ShopifyController::class , 'editAddress']);
+Route::get('edit-address', [ShopifyController::class , 'editAddress'])->name('address.edit');
 Route::post('/update-address', [ShopifyController::class , 'updateAddress'])->name('address.update');
 
 Auth::routes();
 
 // Forgot Password - OTP-based flow
 Route::get('forgot-password', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'forgotPassword'])->name('forgot-password');
-Route::post('forgot-password', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'forgotPasswordSend'])->name('forgot-password.post');
-Route::post('forgot-password/send-otp', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'sendOtp'])->name('forgot-password.send-otp');
+Route::post('forgot-password', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'forgotPasswordSend'])->name('forgot-password.post')->middleware('throttle:10,1');
+Route::post('forgot-password/send-otp', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'sendOtp'])->name('forgot-password.send-otp')->middleware('throttle:10,1');
 Route::get('forgot-password/verify-otp', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'showVerifyOtp'])->name('forgot-password.verify-otp');
-Route::post('forgot-password/verify-otp', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'verifyOtp'])->name('forgot-password.verify-otp.post');
+Route::post('forgot-password/verify-otp', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'verifyOtp'])->name('forgot-password.verify-otp.post')->middleware('throttle:10,1');
 Route::get('forgot-password/reset', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'showResetPassword'])->name('forgot-password.reset');
-Route::post('forgot-password/reset', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'resetPassword'])->name('forgot-password.reset.post');
-Route::post('forgot-password/resend-otp', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'resendOtp'])->name('forgot-password.resend-otp');
+Route::post('forgot-password/reset', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'resetPassword'])->name('forgot-password.reset.post')->middleware('throttle:10,1');
+Route::post('forgot-password/resend-otp', [App\Http\Controllers\Auth\ForgotPasswordController::class , 'resendOtp'])->name('forgot-password.resend-otp')->middleware('throttle:10,1');
 
-Route::post('post-login', [App\Http\Controllers\Auth\LoginController::class , 'postLogin'])->name('login.post');
+Route::post('post-login', [App\Http\Controllers\Auth\LoginController::class , 'postLogin'])->name('login.post')->middleware('throttle:10,1');
 
-Route::post('register', [App\Http\Controllers\Auth\RegisterController::class , 'postRegister'])->name('register.store');
-Route::post('verfiy-otp', [App\Http\Controllers\Auth\RegisterController::class , 'verifyOTP'])->name('register.verify-otp');
-Route::post('resend-otp', [App\Http\Controllers\Auth\RegisterController::class , 'resend'])->name('register.resend-otp');
+Route::post('register', [App\Http\Controllers\Auth\RegisterController::class , 'postRegister'])->name('register.store')->middleware('throttle:10,1');
+Route::post('verfiy-otp', [App\Http\Controllers\Auth\RegisterController::class , 'verifyOTP'])->name('register.verify-otp')->middleware('throttle:10,1');
+Route::post('resend-otp', [App\Http\Controllers\Auth\RegisterController::class , 'resend'])->name('register.resend-otp')->middleware('throttle:10,1');
 
 Route::get('/home', [App\Http\Controllers\HomeController::class , 'index'])->name('home');
 Route::post('/courier-wise-count-ajax', [App\Http\Controllers\HomeController::class , 'courierWiseTotalAjax'])->name('home.courier-wise-count-ajax');
@@ -207,7 +207,7 @@ Route::group(['prefix' => 'change-password'], function () {
 //Setting
 Route::group(['prefix' => 'setting'], function () {
 	Route::get('/general', [App\Http\Controllers\SettingController::class , 'index'])->name('general-setting')->middleware('permission:general_setting.view');
-	Route::post('/general/update', [App\Http\Controllers\SettingController::class , 'updateGeneral'])->name('setting.update');
+	Route::post('/general/update', [App\Http\Controllers\SettingController::class , 'updateGeneral'])->name('setting.update')->middleware('permission:general_setting.view');
 	Route::get('/lable-preferance', [App\Http\Controllers\SettingController::class , 'lablePreferance'])->name('lable.preferance');
 	Route::post('/update-preferance', [App\Http\Controllers\SettingController::class , 'updateLablePref']);
 	Route::get('/bank-details', [App\Http\Controllers\SettingController::class , 'bankDetails'])->name('setting.bank-details');
@@ -309,21 +309,21 @@ Route::group(['prefix' => 'pickup-request'], function () {
 Route::get('courier-commission', [App\Http\Controllers\CourierCommissionController::class , 'index'])->name('courier.commission')->middleware('permission:general_setting.view');
 Route::post('/verify-passkey', [App\Http\Controllers\CourierCommissionController::class , 'verifyPasskey'])->name('verify.passkey');
 
-Route::post('courier-commission', [App\Http\Controllers\CourierCommissionController::class , 'update'])->name('courier.commission.store');
-Route::get('users/commission/{userId}', [App\Http\Controllers\CourierCommissionController::class , 'userCommission'])->name('courier.commission.user');
-Route::post('user-courier-commission', [App\Http\Controllers\CourierCommissionController::class , 'userCommissionUpdate'])->name('users.courier.commission.store');
+Route::post('courier-commission', [App\Http\Controllers\CourierCommissionController::class , 'update'])->name('courier.commission.store')->middleware('permission:general_setting.view');
+Route::get('users/commission/{userId}', [App\Http\Controllers\CourierCommissionController::class , 'userCommission'])->name('courier.commission.user')->middleware('permission:general_setting.view');
+Route::post('user-courier-commission', [App\Http\Controllers\CourierCommissionController::class , 'userCommissionUpdate'])->name('users.courier.commission.store')->middleware('permission:general_setting.view');
 
 //User
 Route::group(['prefix' => 'users'], function () {
 	Route::get('/', [App\Http\Controllers\UserController::class , 'index'])->name('users')->middleware('permission:clients.view');
-	Route::post('/ajax', [App\Http\Controllers\UserController::class , 'ajaxUser'])->name('users.ajax');
+	Route::post('/ajax', [App\Http\Controllers\UserController::class , 'ajaxUser'])->name('users.ajax')->middleware('permission:clients.view');
 	Route::get('/create', [App\Http\Controllers\UserController::class , 'createUser'])->name('users.create')->middleware('permission:clients.add');
-	Route::post('/store', [App\Http\Controllers\UserController::class , 'storeUser'])->name('users.store');
+	Route::post('/store', [App\Http\Controllers\UserController::class , 'storeUser'])->name('users.store')->middleware('permission:clients.add');
 	Route::get('/edit/{id}', [App\Http\Controllers\UserController::class , 'editUser'])->middleware('permission:clients.edit');
-	Route::post('/update/{id}', [App\Http\Controllers\UserController::class , 'updateUser'])->name('users.update');
-	Route::get('/delete/{id}', [App\Http\Controllers\UserController::class , 'deleteUser']);
+	Route::post('/update/{id}', [App\Http\Controllers\UserController::class , 'updateUser'])->name('users.update')->middleware('permission:clients.edit');
+	Route::get('/delete/{id}', [App\Http\Controllers\UserController::class , 'deleteUser'])->middleware('permission:clients.delete');
 
-	Route::post('/recharge/offline', [App\Http\Controllers\UserController::class , 'rechargeOffline']);
+	Route::post('/recharge/offline', [App\Http\Controllers\UserController::class , 'rechargeOffline'])->middleware('permission:clients.edit');
 
 	//KYC USER
 	Route::get('/kyc/edit', [App\Http\Controllers\UserController::class , 'kycUser'])->name('users.kyc.edit');
@@ -337,12 +337,12 @@ Route::group(['prefix' => 'users'], function () {
 
 	//KYC ADMIN
 	Route::get('/kyc/request', [App\Http\Controllers\UserController::class , 'kycUserRequest'])->name('users.kyc.request')->middleware('permission:client_kyc_request.view');
-	Route::post('/kyc/request-ajax', [App\Http\Controllers\UserController::class , 'kycUserRequestAjax'])->name('users.kyc-request.ajax');
-	Route::post('/kyc/update-status', [App\Http\Controllers\UserController::class , 'kycUserUpdateStatus'])->name('users.kyc.update-status');
-	Route::post('/kyc/update-user-status', [App\Http\Controllers\UserController::class , 'updateUserKycStatus'])->name('users.kyc.update-user-status');
+	Route::post('/kyc/request-ajax', [App\Http\Controllers\UserController::class , 'kycUserRequestAjax'])->name('users.kyc-request.ajax')->middleware('permission:client_kyc_request.view');
+	Route::post('/kyc/update-status', [App\Http\Controllers\UserController::class , 'kycUserUpdateStatus'])->name('users.kyc.update-status')->middleware('permission:client_kyc_request.edit');
+	Route::post('/kyc/update-user-status', [App\Http\Controllers\UserController::class , 'updateUserKycStatus'])->name('users.kyc.update-user-status')->middleware('permission:client_kyc_request.edit');
 	Route::get('/kyc/verified/{id}', [App\Http\Controllers\UserController::class , 'kycUserRequestVerified'])->middleware('permission:client_kyc_request.edit');
-	Route::post('/kyc/verified', [App\Http\Controllers\UserController::class , 'kycUserVerified'])->name('users.kyc.verified');
-	Route::post('/kyc/rejected', [App\Http\Controllers\UserController::class , 'kycUserRejected'])->name('users.kyc.rejected');
+	Route::post('/kyc/verified', [App\Http\Controllers\UserController::class , 'kycUserVerified'])->name('users.kyc.verified')->middleware('permission:client_kyc_request.edit');
+	Route::post('/kyc/rejected', [App\Http\Controllers\UserController::class , 'kycUserRejected'])->name('users.kyc.rejected')->middleware('permission:client_kyc_request.edit');
 
 	// API Verification Routes (Admin Side)
 	Route::post('/kyc/verify-pan-api', [App\Http\Controllers\UserController::class , 'verifyPanApi'])->name('users.kyc.verify-pan-api');
@@ -400,8 +400,8 @@ Route::get('roles/groups/{id}', [App\Http\Controllers\StaffController::class , '
 //Shippping Company
 Route::group(['prefix' => 'shipping/company'], function () {
 	Route::get('/', [App\Http\Controllers\ShippingController::class , 'index'])->name('shipping.company')->middleware('permission:shipping_company.view');
-	Route::post('/store', [App\Http\Controllers\ShippingController::class , 'storeShipping'])->name('shipping.company.store');
-	Route::post('/update', [App\Http\Controllers\ShippingController::class , 'updateShipping'])->name('shipping.company.update');
+	Route::post('/store', [App\Http\Controllers\ShippingController::class , 'storeShipping'])->name('shipping.company.store')->middleware('not.seller');
+	Route::post('/update', [App\Http\Controllers\ShippingController::class , 'updateShipping'])->name('shipping.company.update')->middleware('not.seller');
 	Route::get('/{id}/workspace', [App\Http\Controllers\ShippingController::class, 'companyWorkspace'])->name('shipping.company.workspace')->middleware('permission:shipping_company.edit');
 	Route::get('/{id}/manage-pincode', [App\Http\Controllers\ShippingController::class, 'managePincode'])->name('shipping.company.manage-pincode')->middleware('permission:shipping_company.edit');
 	Route::post('/{id}/manage-pincode/ajax', [App\Http\Controllers\ShippingController::class, 'managePincodeAjax'])->name('shipping.company.manage-pincode.ajax')->middleware('permission:shipping_company.edit');
@@ -427,41 +427,41 @@ Route::prefix('rate')->name('rate.')->group(function () {
 	//Zone Setting
 	Route::get('zone-setting', [App\Http\Controllers\ShippingController::class , 'rateZoneSetting'])->name('zone-setting');
 	Route::post('zone-setting/ajax', [App\Http\Controllers\ShippingController::class , 'rateZoneAjaxList'])->name('zone-setting.ajax');
-	Route::post('zone-setting/store', [App\Http\Controllers\ShippingController::class , 'storeZoneSetting'])->name('zone-setting.store');
-	Route::post('zone-setting/update/{id}', [App\Http\Controllers\ShippingController::class , 'updateZoneSetting'])->name('zone-setting.update');
+	Route::post('zone-setting/store', [App\Http\Controllers\ShippingController::class , 'storeZoneSetting'])->name('zone-setting.store')->middleware('not.seller');
+	Route::post('zone-setting/update/{id}', [App\Http\Controllers\ShippingController::class , 'updateZoneSetting'])->name('zone-setting.update')->middleware('not.seller');
 	Route::get('zone-setting/edit/{id}', [App\Http\Controllers\ShippingController::class , 'getZoneSetting'])->name('zone-setting.get'); // fetch single for edit
 	Route::get('zone-setting/options', [App\Http\Controllers\ShippingController::class , 'getZoneOptions'])->name('zone-setting.options');
-	Route::post('pdate-sort-order', [App\Http\Controllers\ShippingController::class , 'updateZoneSettingSortOrder'])->name('zone-setting.update-sort-order'); // fetch single for edit
-	Route::delete('zone-setting/delete/{id}', [App\Http\Controllers\ShippingController::class , 'deleteZoneSetting'])->name('zone-setting.delete');
+	Route::post('pdate-sort-order', [App\Http\Controllers\ShippingController::class , 'updateZoneSettingSortOrder'])->name('zone-setting.update-sort-order')->middleware('not.seller'); // fetch single for edit
+	Route::delete('zone-setting/delete/{id}', [App\Http\Controllers\ShippingController::class , 'deleteZoneSetting'])->name('zone-setting.delete')->middleware('not.seller');
 
 	//Rate Card
 	Route::get('card', [App\Http\Controllers\ShippingController::class , 'rateCard'])->name('card');
 	Route::post('card/ajax', [App\Http\Controllers\ShippingController::class , 'rateCardAjax'])->name('card.ajax');
 	Route::get('card/add', [App\Http\Controllers\ShippingController::class , 'rateCardAdd'])->name('card.add');
-	Route::post('card/store', [App\Http\Controllers\ShippingController::class , 'rateCardStore'])->name('card.store');
+	Route::post('card/store', [App\Http\Controllers\ShippingController::class , 'rateCardStore'])->name('card.store')->middleware('not.seller');
 	Route::get('card/edit/{id}', [App\Http\Controllers\ShippingController::class , 'rateCardEdit'])->name('card.edit');
-	Route::post('card/update/{id}', [App\Http\Controllers\ShippingController::class , 'rateCardUpdate'])->name('card.update');
-	Route::post('card/delete/{id}', [App\Http\Controllers\ShippingController::class , 'rateCardDelete'])->name('card.delete');
+	Route::post('card/update/{id}', [App\Http\Controllers\ShippingController::class , 'rateCardUpdate'])->name('card.update')->middleware('not.seller');
+	Route::post('card/delete/{id}', [App\Http\Controllers\ShippingController::class , 'rateCardDelete'])->name('card.delete')->middleware('not.seller');
 
 	// Price List
 	Route::get('price-list', [App\Http\Controllers\ShippingController::class , 'priceList'])->name('price-list');
 	Route::post('price-list-ajax', [App\Http\Controllers\ShippingController::class , 'priceListAjax'])->name('price-list.ajax');
-	Route::post('price-list/matrix-save', [App\Http\Controllers\ShippingController::class , 'priceListMatrixSave'])->name('price-list.matrix-save');
-	Route::post('price-list/b2c-save', [App\Http\Controllers\ShippingController::class , 'priceListB2cSave'])->name('price-list.b2c-save');
-	Route::post('overhead-charges/update', [App\Http\Controllers\ShippingController::class , 'updateOverheadCharges'])->name('overhead-charges.update');
+	Route::post('price-list/matrix-save', [App\Http\Controllers\ShippingController::class , 'priceListMatrixSave'])->name('price-list.matrix-save')->middleware('not.seller');
+	Route::post('price-list/b2c-save', [App\Http\Controllers\ShippingController::class , 'priceListB2cSave'])->name('price-list.b2c-save')->middleware('not.seller');
+	Route::post('overhead-charges/update', [App\Http\Controllers\ShippingController::class , 'updateOverheadCharges'])->name('overhead-charges.update')->middleware('not.seller');
 	Route::get('overhead-charges', [App\Http\Controllers\ShippingController::class , 'overheadChargesShow'])->name('overhead-charges.show');
-	Route::post('overhead-charges/save', [App\Http\Controllers\ShippingController::class , 'overheadChargesSave'])->name('overhead-charges.save');
-	Route::post('overhead-charges/delete', [App\Http\Controllers\ShippingController::class , 'overheadChargesDelete'])->name('overhead-charges.delete');
+	Route::post('overhead-charges/save', [App\Http\Controllers\ShippingController::class , 'overheadChargesSave'])->name('overhead-charges.save')->middleware('not.seller');
+	Route::post('overhead-charges/delete', [App\Http\Controllers\ShippingController::class , 'overheadChargesDelete'])->name('overhead-charges.delete')->middleware('not.seller');
 
 	// Other Charges Master
 	Route::get('other-charges-master', [App\Http\Controllers\ShippingController::class , 'otherChargesMasterIndex'])->name('other-charges-master');
-	Route::post('other-charges-master', [App\Http\Controllers\ShippingController::class , 'otherChargesMasterStore'])->name('other-charges-master.store');
-	Route::post('other-charges-master/{id}', [App\Http\Controllers\ShippingController::class , 'otherChargesMasterUpdate'])->name('other-charges-master.update');
-	Route::post('other-charges-master/{id}/delete', [App\Http\Controllers\ShippingController::class , 'otherChargesMasterDelete'])->name('other-charges-master.delete');
+	Route::post('other-charges-master', [App\Http\Controllers\ShippingController::class , 'otherChargesMasterStore'])->name('other-charges-master.store')->middleware('not.seller');
+	Route::post('other-charges-master/{id}', [App\Http\Controllers\ShippingController::class , 'otherChargesMasterUpdate'])->name('other-charges-master.update')->middleware('not.seller');
+	Route::post('other-charges-master/{id}/delete', [App\Http\Controllers\ShippingController::class , 'otherChargesMasterDelete'])->name('other-charges-master.delete')->middleware('not.seller');
 
 	// Rate Card Other Charges (B2B)
 	Route::get('other-charges/assignments', [App\Http\Controllers\ShippingController::class , 'rateCardOtherChargesShow'])->name('other-charges.assignments');
-	Route::post('other-charges/assignments', [App\Http\Controllers\ShippingController::class , 'rateCardOtherChargesSave'])->name('other-charges.assignments.save');
+	Route::post('other-charges/assignments', [App\Http\Controllers\ShippingController::class , 'rateCardOtherChargesSave'])->name('other-charges.assignments.save')->middleware('not.seller');
 
 	//Rate Group
 	Route::get('card/group', [App\Http\Controllers\ShippingController::class , 'rateCardGroup'])->name('card.group');
@@ -470,10 +470,10 @@ Route::prefix('rate')->name('rate.')->group(function () {
 	//Shipping Weight
 	Route::get('shipping-weight', [App\Http\Controllers\ShippingController::class , 'shippingWeight'])->name('shipping-weight');
 	Route::post('shipping-weight/ajax', [App\Http\Controllers\ShippingController::class , 'shippingWeightAjax'])->name('shipping-weight.ajax');
-	Route::post('shipping-weight/store', [App\Http\Controllers\ShippingController::class , 'storeShippingWeight'])->name('shipping-weight.store');
+	Route::post('shipping-weight/store', [App\Http\Controllers\ShippingController::class , 'storeShippingWeight'])->name('shipping-weight.store')->middleware('not.seller');
 	Route::get('shipping-weight/edit/{id}', [App\Http\Controllers\ShippingController::class , 'getShippingWeight'])->name('shipping-weight.get');
-	Route::post('shipping-weight/update/{id}', [App\Http\Controllers\ShippingController::class , 'updateShippingWeight'])->name('shipping-weight.update');
-	Route::post('shipping-weight/delete/{id}', [App\Http\Controllers\ShippingController::class , 'deleteShippingWeight'])->name('shipping-weight.delete');
+	Route::post('shipping-weight/update/{id}', [App\Http\Controllers\ShippingController::class , 'updateShippingWeight'])->name('shipping-weight.update')->middleware('not.seller');
+	Route::post('shipping-weight/delete/{id}', [App\Http\Controllers\ShippingController::class , 'deleteShippingWeight'])->name('shipping-weight.delete')->middleware('not.seller');
 
 
 	Route::get('calculator', [App\Http\Controllers\ShippingController::class , 'rateCalculator'])->name('calculator')
@@ -528,9 +528,9 @@ Route::group(['prefix' => 'order'], function () {
 	Route::post('/store', [App\Http\Controllers\OrderController::class , 'orderStore'])->name('order.store');
 	Route::get('/edit/{id}', [App\Http\Controllers\OrderController::class , 'orderEdit']);
 	Route::post('/update/{id}', [App\Http\Controllers\OrderController::class , 'orderUpdate'])->name('order.update');
-	Route::get('/delete/{id}', [App\Http\Controllers\OrderController::class , 'orderDelete']);
+	Route::post('/delete/{id}', [App\Http\Controllers\OrderController::class , 'orderDelete']);
 	Route::get('/clone/{id}', [App\Http\Controllers\OrderController::class , 'orderClone']);
-	Route::get('/cancel/{id}', [App\Http\Controllers\OrderController::class , 'orderCancel']);
+	Route::post('/cancel/{id}', [App\Http\Controllers\OrderController::class , 'orderCancel']);
 	Route::post('/credit-lost-order', [App\Http\Controllers\OrderController::class , 'creditLostOrder'])->name('order.credit-lost-order');
 	Route::post('/manual-status-update', [App\Http\Controllers\OrderController::class , 'manualStatusUpdate'])->name('order.manual-status-update');
 
@@ -542,7 +542,7 @@ Route::group(['prefix' => 'order'], function () {
 	Route::get('/shipment/charge/{orderId}', [App\Http\Controllers\OrderController::class , 'orderShipCharge']);
 	Route::post('/ship/now', [App\Http\Controllers\OrderController::class , 'orderShipNow'])->name('order.ship.now');
 
-	Route::get('/cancel-api/{id}', [App\Http\Controllers\OrderController::class , 'orderCancelApi']);
+	Route::post('/cancel-api/{id}', [App\Http\Controllers\OrderController::class , 'orderCancelApi']);
 	Route::get('/tracking-history/{id}', [App\Http\Controllers\OrderController::class , 'orderTrackingHistory']);
 	Route::post('/manual-status/{id}', [App\Http\Controllers\OrderController::class , 'orderManualStatusUpdate'])->name('order.manual-status');
 
@@ -591,17 +591,17 @@ Route::group(['prefix' => 'cod-payout'], function () {
 Route::group(['prefix' => 'cod-settings'], function () {
 	Route::get('/', [App\Http\Controllers\CodSettingController::class , 'index'])->name('cod-settings.index')->middleware('permission:cod_setting.view');
 	Route::get('/create', [App\Http\Controllers\CodSettingController::class , 'create'])->name('cod-settings.create')->middleware('permission:cod_setting.add');
-	Route::post('/store', [App\Http\Controllers\CodSettingController::class , 'store'])->name('cod-settings.store');
+	Route::post('/store', [App\Http\Controllers\CodSettingController::class , 'store'])->name('cod-settings.store')->middleware('permission:cod_setting.add');
 	Route::get('/{codSetting}/edit', [App\Http\Controllers\CodSettingController::class , 'edit'])->name('cod-settings.edit')->middleware('permission:cod_setting.edit');
-	Route::put('/{codSetting}', [App\Http\Controllers\CodSettingController::class , 'update'])->name('cod-settings.update');
+	Route::put('/{codSetting}', [App\Http\Controllers\CodSettingController::class , 'update'])->name('cod-settings.update')->middleware('permission:cod_setting.edit');
 	Route::delete('/{codSetting}', [App\Http\Controllers\CodSettingController::class , 'destroy'])->name('cod-settings.destroy')->middleware('permission:cod_setting.delete');
 	;
-	Route::post('/{codSetting}/toggle-status', [App\Http\Controllers\CodSettingController::class , 'toggleStatus'])->name('cod-settings.toggle-status');
-	Route::post('/{codSetting}/set-default', [App\Http\Controllers\CodSettingController::class , 'setDefault'])->name('cod-settings.set-default');
+	Route::post('/{codSetting}/toggle-status', [App\Http\Controllers\CodSettingController::class , 'toggleStatus'])->name('cod-settings.toggle-status')->middleware('permission:cod_setting.edit');
+	Route::post('/{codSetting}/set-default', [App\Http\Controllers\CodSettingController::class , 'setDefault'])->name('cod-settings.set-default')->middleware('permission:cod_setting.edit');
 
 	// Holiday routes
-	Route::post('/holiday/store', [App\Http\Controllers\CodSettingController::class , 'storeHoliday'])->name('cod-settings.holiday.store');
-	Route::delete('/holiday/{id}', [App\Http\Controllers\CodSettingController::class , 'destroyHoliday'])->name('cod-settings.holiday.delete');
+	Route::post('/holiday/store', [App\Http\Controllers\CodSettingController::class , 'storeHoliday'])->name('cod-settings.holiday.store')->middleware('permission:cod_setting.add');
+	Route::delete('/holiday/{id}', [App\Http\Controllers\CodSettingController::class , 'destroyHoliday'])->name('cod-settings.holiday.delete')->middleware('permission:cod_setting.delete');
 
 	// Terms and Conditions routes
 	Route::get('/terms', [App\Http\Controllers\CodSettingController::class , 'getTerms'])->name('cod-settings.terms.get');

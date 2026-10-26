@@ -37,10 +37,11 @@ class DelhiveryService
 			])
 			->post($baseUrl . '/ums/login', $requestBody);
 
+		// Never log the password or the issued token
 		Log::info('Delhivery Token', [
 			'company_id' => $shippingCompany->id,
-			'request' => $requestBody,
-			'response' => $response->json(),
+			'request' => \Illuminate\Support\Arr::except((array) $requestBody, ['password']),
+			'response_keys' => array_keys((array) $response->json()),
 			'status' => $response->status()
 		]);
 

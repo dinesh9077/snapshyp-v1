@@ -301,7 +301,6 @@
                                 window.location.href = res.redirect;
                             }, 1000);
                         } else if (res.status == "mail") {
-                            localStorage.setItem('generatedOtp', res.otp);
                             otpModal.show();
                         } else {
                             toastrMsg(res.status, res.msg);
@@ -320,16 +319,10 @@
 
                 // Disable submit button to prevent multiple submissions
                 $otpForm.find(':submit').prop('disabled', true);
-                const generatedOtp = localStorage.getItem('generatedOtp');
 
-                if (!generatedOtp) {
-                    toastrMsg("error", "Something went wrong. Please try again.");
-                    return;
-                }
-
-                // Create FormData object
+                // The server looks the OTP up by email; the browser never holds it
                 var formData = new FormData(this);
-                formData.append('generatedOtp', generatedOtp);
+                formData.append('email', $signupForm.find('#email').val() || '');
 
                 $.ajax({
                     type: $otpForm.attr('method'),
@@ -387,7 +380,6 @@
                         $resendOtp.prop('disabled', false);
 
                         if (res.status === "mail") {
-                            localStorage.setItem('generatedOtp', res.otp);
                             toastrMsg("success", res.msg);
                         } else {
                             toastrMsg("error", res.msg);

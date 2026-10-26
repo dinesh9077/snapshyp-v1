@@ -29,6 +29,11 @@ class ProcessBulkShipment implements ShouldQueue
     protected array $requestData;
     protected $user;
 
+    // Booking shipments is not safe to repeat automatically, and a batch can take long
+    // (several courier calls per order). Keep queue retry_after above this timeout.
+    public $tries = 1;
+    public $timeout = 3600;
+
     public function __construct(array $orderIds, array $requestData = [], $user = null)
     {
         $this->orderIds = $orderIds;
@@ -54,9 +59,11 @@ class ProcessBulkShipment implements ShouldQueue
             'errors' => 0,  // exceptions thrown
         ];
 
-        Order::whereIn('id', $this->orderIds)->update(['queue' => 0]);
+        // Orders keep queue = 1 ("Processing") until each one is handled below
         $shippingCompany = ShippingCompany::whereStatus(1)->where('id', $this->requestData['courier_shipment_id'])->first();
         if (!$shippingCompany) {
+            Order::whereIn('id', $this->orderIds)->where('queue', 1)
+                ->update(['queue' => 0, 'shipment_failure_reason' => 'Selected courier is not available']);
             return;
         }
         foreach ($this->orderIds as $orderId) {
@@ -193,7 +200,10 @@ class ProcessBulkShipment implements ShouldQueue
                     'actor_user_id' => $this->user->id ?? null,
                 ];
 
-                $response = $shipmentProcessor->orderShipNow($requestParam);
+                // In a transaction so the processor's row locks hold against a parallel single ship
+                $response = \Illuminate\Support\Facades\DB::transaction(function () use ($shipmentProcessor, $requestParam) {
+                    return $shipmentProcessor->orderShipNow($requestParam);
+                });
 
                 if ($response === 1) {
                     $order->refresh();
@@ -260,5 +270,12 @@ class ProcessBulkShipment implements ShouldQueue
         } else {
             Log::info('Bulk shipment completed (no user)', $summary);
         }
+    }
+
+    // Job died (timeout, crash): don't leave orders stuck in "Processing"
+    public function failed(\Throwable $e): void
+    {
+        Order::whereIn('id', $this->orderIds)->where('queue', 1)
+            ->update(['queue' => 0, 'shipment_failure_reason' => 'Bulk shipment stopped: ' . substr($e->getMessage(), 0, 150)]);
     }
 }

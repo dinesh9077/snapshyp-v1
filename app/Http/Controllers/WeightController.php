@@ -97,8 +97,22 @@
 			return view('weight.descrepensies.all_descrepencies', compact('users', 'orders'));
 		}
   
+		// Raising, importing and deciding discrepancies is admin/staff work; sellers only accept or remark
+		private function abortIfSeller(): void
+		{
+			if (auth()->user()->role === 'user') {
+				abort(403);
+			}
+		}
+
 		public function raiseExcessWeight(Request $request)
 		{
+			$this->abortIfSeller();
+			$request->validate([
+				'order_id' => 'required|integer|exists:orders,id',
+				'excess_charge' => 'required|numeric|gt:0',
+			]);
+
 			try {
 				DB::beginTransaction(); // Start transaction
 				$orderId = $request->order_id;
@@ -569,6 +583,11 @@
 
 				// Fetch Order & Excess Weight
 				$order = Order::with('user')->findOrFail($id);
+				// A seller can accept only their own order's discrepancy
+				if (auth()->user()->role === 'user' && (int) $order->user_id !== (int) auth()->id()) {
+					DB::rollBack();
+					return response()->json(['status' => 'error', 'msg' => 'Permission denied.'], 403);
+				}
 				$excess_weight = ExcessWeight::where('order_id', $id)->firstOrFail();
 				$excess_charge = $excess_weight->excess_charge;
 
@@ -586,31 +605,43 @@
   
 		public function weightbycourier(Request $request)
 		{
+			$this->abortIfSeller();
 			$id = $request->order_id;
 			$status = $request->acton;
-			
+
 			$order = Order::whereId($id)->first();
+			if (!$order) {
+				return response()->json(['status' => 'error', 'msg' => 'Order not found.'], 404);
+			}
+
 			if($status == "Dispute Accepted by Courier")
 			{
-				
+
 				$excess_weight = ExcessWeight::whereOrder_id($id)->first();
+				if (!$excess_weight) {
+					return response()->json(['status' => 'error', 'msg' => 'No excess weight raised for this order.'], 422);
+				}
 				$excess_charge = $excess_weight->excess_charge;
-				
-				$userwalt = User::whereId($order->user_id)->first(); 
-				$walletamunt = $userwalt->wallet_amount - $excess_charge;
-				User::whereId($order->user_id)->update(['wallet_amount'=>$walletamunt]); 
-				
-				Billing::insert([
-				'user_id'=>$order->user_id,
-				'billing_type'=>"Order",
-				'billing_type_id'=>$order->id,
-				'transaction_type'=>'debit',
-				'amount'=>$excess_charge,
-				'note'=>'Excess weight is apply with awb number : '.$order->awb_number,
-				'created_at'=>date('Y-m-d H:i:s'),
-				'updated_at'=>date('Y-m-d H:i:s'),
-				]);
-				
+
+				DB::transaction(function () use ($order, $excess_charge) {
+					// Charge once per order, atomically (the old read-then-write could double-charge)
+					User::whereKey($order->user_id)->lockForUpdate()->first();
+					if (!$this->weightAlreadyBilled($order)) {
+						User::whereKey($order->user_id)->decrement('wallet_amount', $excess_charge);
+
+						Billing::insert([
+						'user_id'=>$order->user_id,
+						'billing_type'=>"Order",
+						'billing_type_id'=>$order->id,
+						'transaction_type'=>'debit',
+						'amount'=>$excess_charge,
+						'note'=>'Excess weight is apply with awb number : '.$order->awb_number,
+						'created_at'=>date('Y-m-d H:i:s'),
+						'updated_at'=>date('Y-m-d H:i:s'),
+						]);
+					}
+				});
+
 				weightDescrepencyHistory::insert(['order_id'=>$id,'action_by'=>'Courier','remarks'=>'','status_descrepency'=>$status,'created_at'=>date('Y-m-d H:i:s'),'updated_at'=>date('Y-m-d H:i:s')]);
 			}
 			else
@@ -709,6 +740,7 @@
 
 		public function autoAccepted()
 		{
+			$this->abortIfSeller();
 			$excess_weights = ExcessWeight::select('excess_weights.*', 'o.id as order_id', 'o.user_id', 'o.awb_number')
 				->join('orders as o', 'o.id', '=', 'excess_weights.order_id')
 				->whereIn('o.weight_status', ['New', 'New Descrepency'])
@@ -718,21 +750,32 @@
 				foreach ($excess_weights as $excess_weight) {
 					$order = Order::find($excess_weight->order_id);
 					if ($order) {
-						$this->processWeightDeduction($order, $excess_weight->excess_charge, 'System Auto Accept');
+						DB::transaction(function () use ($order, $excess_weight) {
+							$this->processWeightDeduction($order, $excess_weight->excess_charge, 'System Auto Accept');
+						});
 					}
 				}
 			}
 			return response()->json(['status' => 'success', 'msg' => 'All pending weight discrepancies have been accepted']);
 		}
 
-		private function processWeightDeduction($order, $excessCharge, $actionBy = 'Admin')
+		// Has this order's weight discrepancy already been charged to the seller?
+		private function weightAlreadyBilled($order): bool
 		{
-			// Check if already billed for this order's weight discrepancy to avoid double deduction
-			$alreadyBilled = Billing::where('user_id', $order->user_id)
+			return Billing::where('user_id', $order->user_id)
 				->where('billing_type', 'Order')
 				->where('billing_type_id', $order->id)
 				->where('note', 'like', '%weight%')
 				->exists();
+		}
+
+		// Callers run this inside a transaction; the user row lock makes concurrent accepts wait
+		private function processWeightDeduction($order, $excessCharge, $actionBy = 'Admin')
+		{
+			User::whereKey($order->user_id)->lockForUpdate()->first();
+
+			// Check if already billed for this order's weight discrepancy to avoid double deduction
+			$alreadyBilled = $this->weightAlreadyBilled($order);
 
 			if (!$alreadyBilled) {
 				$user = User::find($order->user_id);
@@ -860,7 +903,10 @@
 
 		public function index(Request $request)
 		{
-			$userId = $request->user_id ?? auth()->user()->id;
+			// A seller always sees only their own discrepancies, whatever user_id is sent
+			$userId = auth()->user()->role === 'user'
+				? auth()->id()
+				: ($request->user_id ?? auth()->user()->id);
 			$users = User::where('status', 1)->get();
 
 			// Use eager loading to optimize queries and avoid redundant joins

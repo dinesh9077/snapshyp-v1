@@ -182,11 +182,20 @@
 			}
 		}
 		 
+		// A seller sees only their own tickets; admin/staff handle everyone's
+		private function authorizeTicket(Ticket $ticket): void
+		{
+			if (auth()->user()->role === 'user' && (int) $ticket->user_id !== (int) auth()->id()) {
+				abort(403);
+			}
+		}
+
 		public function ticketView($id)
 		{
 			$ticket = Ticket::with(['remarks' => function ($q) {
 				$q->orderBy('id');
 			}])->findOrFail($id);
+			$this->authorizeTicket($ticket);
 
 			$role = auth()->user()->role;
 
@@ -205,7 +214,8 @@
 				'remark' => 'required|string',
 				'images.*' => 'nullable|image|mimes:jpeg,png,jpg|max:2048',
 			]);
-			
+			$this->authorizeTicket(Ticket::findOrFail($request->ticket_id));
+
 			DB::beginTransaction();
 			try {
 				$ticketId = $request->ticket_id;

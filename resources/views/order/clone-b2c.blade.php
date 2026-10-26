@@ -46,7 +46,7 @@
                                 <div class="col-xl col-lg-4 col-sm-6">
                                     <div class="from-group my-2">
                                         <label for="reference_number"> Reference Number <span class="text-danger">*</span> </label>
-                                        <input type="text" placeholder="Reference Number" name="reference_number" value="{{ $isPrefillMode ? $order->reference_number : '' }}" required>
+                                        <input type="text" placeholder="Reference Number" name="reference_number" value="{{ $isEditMode ? $order->reference_number : '' }}" required>
                                     </div>
                                 </div> 
 								<input type="hidden" name="shipping_mode" value="Surface">
@@ -112,15 +112,15 @@
 								<div class="col-lg-12"> 
 									<div class="row">
 										<div class="from-group col-md-6"> 
-											<label for="order-id"> Recipeint/Customer </label>
+											<label for="order-id"> Recipient/Customer </label>
 											<div class="main-rox-input">
 												<select name="customer_id" class="control-form select2" id="customer_id" style="border-radius: 5px 0px 0px 5px" onchange="customerAddresList(this)" required>
-													<option value="">Select Recipeint/Customer</option>
+													<option value="">Select Recipient/Customer</option>
 												</select>
 												<button type="button" class="new-height-btn-plus" onclick="createCustomer(this, event)"> <i class="mdi mdi-plus"></i> </button>
 											</div>
 										</div> 
-										<div class="from-group col-md-6">
+										<div class="from-group col-md-6 new-border-details" >
 											<label for="order-id"> Customer Address </label>
 											<div class="main-rox-input">
 												<select name="customer_address_id" class="control-form select2" id="customer_address_id" style="border-radius: 5px 0px 0px 5px" onchange="customerAddressChange(this)" required>
@@ -128,7 +128,7 @@
 												</select>
 												<button type="button" class="new-height-btn-plus" disabled data-toggle="tooltip" data-placement="right" title="Kindly select a customer before adding an address." onclick="createCustomerAddress(this, event)"> <i class="mdi mdi-plus"></i> </button>
 											</div>
-											<div class="new-border-details"><div id="customer_address_label"></div></div>
+											<div class=""><div id="customer_address_label"></div></div>
 										</div>
 									</div>
 								</div>

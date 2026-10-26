@@ -68,5 +68,7 @@ class Kernel extends HttpKernel
         'verify.shopify.session' => \App\Http\Middleware\VerifyShopifySession::class,
         'shopifyCsp' => \App\Http\Middleware\ShopifyCsp::class,
         'shopify.embedded.auth' => \App\Http\Middleware\ShopifyEmbeddedAuth::class,
+        'courier.webhook' => \App\Http\Middleware\VerifyCourierWebhook::class,
+        'not.seller' => \App\Http\Middleware\BlockSellers::class,
     ];
 }

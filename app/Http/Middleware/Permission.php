@@ -9,9 +9,28 @@ use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 
 class Permission
-{ 
+{
+    // Admin-panel areas a seller (role "user") must never reach, whatever other permissions say
+    private const ADMIN_ONLY_PREFIXES = [
+        'admin_dashboard', 'general_setting', 'shipping_company', 'cod_setting', 'whatsapp_setting',
+        'status_mapping', 'zipcode', 'clients', 'client_kyc_request', 'ticket_request', 'roles', 'staff',
+    ];
+
     public function handle(Request $request, Closure $next, $permission = null)
     {
+        // This also runs on every web request without a permission (login page etc.);
+        // only routes that name a permission require a logged-in user
+        if (!empty($permission) && !Auth::check()) {
+            return $request->expectsJson()
+                ? response()->json(['status' => 'error', 'msg' => 'Unauthenticated.'], 401)
+                : redirect()->guest(route('login'));
+        }
+
+        if (!empty($permission) && Auth::user()->role === 'user'
+            && in_array(strtok($permission, '.'), self::ADMIN_ONLY_PREFIXES, true)) {
+            return abort(403);
+        }
+
         if (Auth::check())
 		{ 
 			$admin = Auth::user();

@@ -75,6 +75,12 @@ class WebhookController extends Controller
             return response('No change', 200);
         }
 
+        // A late or replayed scan must not move an order out of a final state (e.g. delivered -> in transit)
+        if ($this->isFinalStatus($oldStatus)) {
+            Log::info('Courier webhook ignored: order already in final status', ['order_id' => $order->id, 'old' => $oldStatus, 'new' => $normalizedStatus]);
+            return response('Final status, ignored', 200);
+        }
+
         // 6) Load status mappings into convenient structure
         $statusGroups = $this->loadStatusGroups();
 
@@ -346,6 +352,11 @@ class WebhookController extends Controller
                 continue;
             }
 
+            // A late or replayed scan must not move an order out of a final state
+            if ($this->isFinalStatus($oldStatus)) {
+                continue;
+            }
+
             $statusGroups = $this->loadStatusGroups();
 
             $updateData = ['status_courier' => $normalizedStatus];
@@ -477,6 +488,12 @@ class WebhookController extends Controller
 
         if (strtolower($oldStatus) === $normalizedStatus) {
             return response('No change', 200);
+        }
+
+        // A late or replayed scan must not move an order out of a final state (e.g. delivered -> in transit)
+        if ($this->isFinalStatus($oldStatus)) {
+            Log::info('Courier webhook ignored: order already in final status', ['order_id' => $order->id, 'old' => $oldStatus, 'new' => $normalizedStatus]);
+            return response('Final status, ignored', 200);
         }
 
         $statusGroups = $this->loadStatusGroups();
@@ -672,6 +689,11 @@ class WebhookController extends Controller
             $oldNormalized = preg_replace('/\s+/', ' ', $oldNormalized);
 
             if ($oldNormalized === $normalizedStatus) {
+                continue;
+            }
+
+            // A late or replayed scan must not move an order out of a final state
+            if ($this->isFinalStatus($oldStatus)) {
                 continue;
             }
 
@@ -872,6 +894,11 @@ class WebhookController extends Controller
                 continue;
             }
 
+            // A late or replayed scan must not move an order out of a final state
+            if ($this->isFinalStatus($oldStatus)) {
+                continue;
+            }
+
             $statusGroups = $this->loadStatusGroups();
             $updateData = ['status_courier' => $normalizedStatus];
 
@@ -899,6 +926,12 @@ class WebhookController extends Controller
 
             $order->update($updateData);
             $order = $order->fresh();
+
+            // A queued cancellation was not refunded at cancel time; refund once Shadowfax confirms it
+            if (strtolower(trim((string) $oldStatus)) === 'cancel requested' && $normalizedStatus === 'cancelled') {
+                $this->refundConfirmedCancellation($order);
+            }
+
             $this->triggerRtoSettlementIfNeeded($order, $normalizedStatus, $statusGroups);
             $this->dispatchStatusWebhooks($order, $oldStatus, $normalizedStatus, 'shadowfax_webhook');
 
@@ -927,6 +960,49 @@ class WebhookController extends Controller
         if ($this->statusInGroup($normalizedStatus, $statusGroups, 'RTO All')) {
             Artisan::call('order:apply-rto-charge', ['order_id' => $order->id]);
         }
+    }
+
+    // Refund the seller's shipping charge (once) when the courier confirms a queued cancellation
+    protected function refundConfirmedCancellation(Order $order): void
+    {
+        try {
+            \Illuminate\Support\Facades\DB::transaction(function () use ($order) {
+                $user = \App\Models\User::whereKey($order->user_id)->lockForUpdate()->first();
+                $amount = (float) ($order->shipping_charge ?? 0);
+                if (!$user || $user->role !== 'user' || $amount <= 0) {
+                    return;
+                }
+
+                $alreadyRefunded = \App\Models\Billing::where('billing_type', 'Order')
+                    ->where('billing_type_id', $order->id)
+                    ->where('transaction_type', 'credit')
+                    ->where('note', 'like', '%cancellation confirmed%')
+                    ->exists();
+                if ($alreadyRefunded) {
+                    return;
+                }
+
+                $user->increment('wallet_amount', $amount);
+                \App\Models\Billing::create([
+                    'user_id' => $user->id,
+                    'billing_type' => 'Order',
+                    'billing_type_id' => $order->id,
+                    'transaction_type' => 'credit',
+                    'amount' => $amount,
+                    'note' => 'Shipping charges refunded, cancellation confirmed by courier for AWB: ' . $order->awb_number,
+                ]);
+                app(\App\Services\ShipmentProcessor::class)->reverseShippingCredits($order);
+            });
+        } catch (\Throwable $e) {
+            Log::error('Refund on confirmed cancellation failed', ['order_id' => $order->id, 'error' => $e->getMessage()]);
+        }
+    }
+
+    // Statuses an order never leaves once reached
+    protected function isFinalStatus(?string $status): bool
+    {
+        $status = strtolower(trim(str_replace(['_', '-'], ' ', (string) $status)));
+        return in_array($status, ['delivered', 'cancelled', 'rto delivered', 'lost', 'damaged'], true);
     }
 
     protected function dispatchStatusWebhooks(Order $order, string $oldStatus, string $newStatus, string $source): void

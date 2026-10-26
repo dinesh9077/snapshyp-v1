@@ -21,11 +21,12 @@
 	use App\Mail\ForgotPasswordMail;
 	use Illuminate\Support\Str;
 	use App\Models\CodSetting;
+	use App\Support\EmailOtp;
 	
 	class AuthController extends Controller
 	{
 		use ApiResponse;
-		 
+
 		public function register(Request $request)
 	{ 
 		try { 	
@@ -54,24 +55,24 @@
 
 			if(!isset($request->is_verify_otp) && $request->is_verify_otp == 0)
 			{  
-				$otp = rand(100000, 999999); 
-				UserOtp::updateOrCreate(
-					['email' => $request->email],
-					[
-						'otp' => $otp,
-						'expires_at' => now()->addMinutes(5)
-					]
-				);
+				$otp = rand(100000, 999999);
+				EmailOtp::issue($request->email, $otp, 5);
 
-				Mail::to($request->email)->send(new OtpMail($request->name, $otp)); 
-				
+				Mail::to($request->email)->send(new OtpMail($request->name, $otp));
+
+				// Never return the OTP itself; the client verifies it through /verify-otp
 				return $this->successResponse([
 					'type' => 'mail',
-					'uuid' => base64_encode($otp)
-				], 'An OTP has been sent to your provided email.');  
+				], 'An OTP has been sent to your provided email.');
 			}
 
 			DB::beginTransaction();
+
+			// Registration needs an email OTP that /verify-otp has already confirmed
+			if (!EmailOtp::consumeVerified($request->email)) {
+				DB::rollBack();
+				return $this->errorResponse('Please verify the OTP sent to your email first.', 400);
+			}
 
 			// Calculate next seller_id
 			$maxSellerId = User::max('seller_id');
@@ -87,8 +88,8 @@
 				'name' => $request->name,
 				'email' => $request->email,
 				'mobile' => $request->mobile,
-				'xpass' => $request->password,
 				'password' => Hash::make($request->password),
+				'xpass' => $request->password, // stored encrypted (User casts xpass)
 				'status' => 1,
 				'charge_type' => 1,
 				'charge' => 0,
@@ -137,7 +138,7 @@
 			$token = $tokenResult->accessToken; 
 			$user->token = $token;
 			$user->type = 'register';
-			
+
 			DB::commit();
 			
 			return $this->successResponse($user, 'User registered successfully.'); 
@@ -178,20 +179,12 @@
 				// Web relies on client-side or session uuid, API relies on DB.
 				// We will DO BOTH to support all clients.
 
-				UserOtp::updateOrCreate(
-					['email' => $request->email],
-					[
-						'otp' => $otp,
-						'expires_at' => now()->addMinutes(10)
-					]
-				); 
+				EmailOtp::issue($request->email, $otp, 10);
 				
 				// Send Mail
 				Mail::to($request->email)->send(new OtpMail($request->name, $otp)); 
 				
-				return $this->successResponse([
-					'uuid' => base64_encode($otp)
-				], 'New OTP sent successfully.');
+				return $this->successResponse([], 'New OTP sent successfully.');
 
 			} catch (\Exception $e) {
 				Log::error('Resend OTP failed', [
@@ -209,33 +202,17 @@
 			$validator = Validator::make($request->all(), [
 				'email' => 'required|email|max:255',
 				'otp'   => 'required|digits:6',
-				// 'generatedOtp' is optional, but if present, allows client-side verification logic
 			]);
 
 			if ($validator->fails()) {
 				return $this->validateResponse('Validation failed', 422, $validator->errors());
 			}
 
-			// Dual Verification Strategy:
-			// 1. Check DB (Server-side state) - More secure
-			$userOtp = UserOtp::where('email', $request->email)->first();
-			$dbVerificationPassed = $userOtp && $userOtp->otp == $request->otp && $userOtp->expires_at >= now();
-
-			// 2. Check Client Token (Client-side state) - Matches Web "generatedOtp" logic
-			$clientVerificationPassed = false;
-			if ($request->filled('generatedOtp')) {
-				$decodedGeneratedOtp = base64_decode($request->generatedOtp);
-				if ($decodedGeneratedOtp == $request->otp) {
-					$clientVerificationPassed = true;
-				}
-			}
-
-			// If neither passed, fail
-			if (!$dbVerificationPassed && !$clientVerificationPassed) {
+			// Only the server-side OTP counts; a client-sent "generatedOtp" could be forged
+			if (!EmailOtp::verify($request->email, $request->otp)) {
 				return $this->errorResponse('Invalid or expired OTP.', 400);
 			}
 
-			// Success - OTP verified by at least one method
 			return $this->successResponse([], 'OTP verified successfully.');
 		}
 		
@@ -278,10 +255,10 @@
 				Mail::to($user->email)->send(new ForgotPasswordMail($data));
 				DB::commit();
 				
+				// Never return the OTP; /forgot-password/verify-otp and /reset check it server-side
 				return $this->successResponse([
-					'uuid' => base64_encode($otp),
 					'email' => $request->email,
-				], 'OTP has been sent to your email address.'); 
+				], 'OTP has been sent to your email address.');
 			} catch (\Exception $e) { 
 				DB::rollBack();
 				Log::error('Forgot password OTP failed', [
@@ -345,7 +322,7 @@
 
 				$user = User::where('email', $request->email)->first();
 				$user->password = Hash::make($request->password);
-				$user->xpass = $request->password;
+				$user->xpass = $request->password; // stored encrypted (User casts xpass)
 				$user->save();
 
 				$otpRecord->is_used = true;

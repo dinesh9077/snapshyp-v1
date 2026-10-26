@@ -49,9 +49,12 @@
 											<h5  class="new-title-b2c-order"> Pickup Location <span class="text-danger">*</span></h5>
 											<div class="main-rox-input">
 												<select name="warehouse_id" class="control-form select2" id="warehouse_id" style="border-radius: 5px 0px 0px 5px" onchange="warehousePickup(this)" required>
-													<option value="">Select Pickup Location</option> 
-												</select> 
+													<option value="">Select Pickup Location</option>
+												</select>
 											</div>
+										</div>
+										<div class="col-md-6">
+											<div class="new-border-details"><div id="warehouse_lable"></div></div>
 										</div>
 									</div>
 								</div>
@@ -157,6 +160,20 @@
 		syncSelectedSample();
 		$('#type_of_package').on('change', syncSelectedSample);
 
+		// List each failing Excel row so the user can fix the file
+		function showRowErrors(title, errors) {
+			const rows = errors.map(function (e) {
+				return `<tr><td style="padding:6px 10px;white-space:nowrap;vertical-align:top;">Row ${e.row}</td><td style="padding:6px 10px;">${$('<div>').text(e.message).html()}</td></tr>`;
+			}).join('');
+
+			Swal.fire({
+				icon: 'error',
+				title: title,
+				width: 700,
+				html: `<div style="max-height:350px;overflow:auto;text-align:left;"><table class="table table-sm mb-0">${rows}</table></div>`,
+			});
+		}
+
 		$orderForm.submit(function (event) {
 			event.preventDefault();
 
@@ -178,7 +195,11 @@
 				success: function (res) {
 					$orderForm.find(':submit').prop('disabled', false); // Re-enable submit button
 
-					toastrMsg(res.status, res.msg); // Show notification
+					if (res.errors && res.errors.length) {
+						showRowErrors(res.msg, res.errors);
+					} else {
+						toastrMsg(res.status, res.msg); // Show notification
+					}
 
 					if (res.status === "success") {
 						const weightOrder = res.type_of_package ?? 1;

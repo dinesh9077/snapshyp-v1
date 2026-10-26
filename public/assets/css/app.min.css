@@ -9078,6 +9078,23 @@ td .btn.btn-icon.waves-effect.waves-light.action-icon {
     font-weight: 400;
 }
 
+/* Delivery Details under Customer Address, styled like Pickup Details */
+#customer_address_label {
+    margin-top: 12px;
+}
+
+#customer_address_label label {
+    font-size: 16px;
+    color: black;
+    font-weight: 600;
+}
+
+#customer_address_label p {
+    font-size: 15px;
+    color: #161616 !important;
+    font-weight: 400;
+}
+
 .table .thead-light th {
     color: #3c3c3c;
     background-color: #f8faffb8;

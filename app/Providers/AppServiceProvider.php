@@ -18,7 +18,10 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register()
     {
-        //
+        // queue:work must not crash where pcntl is loaded but its functions are disabled (shared hosting)
+        $this->app->extend('queue.worker', function ($worker) {
+            return \App\Queue\SignalSafeWorker::fromWorker($worker);
+        });
     }
 
     /**

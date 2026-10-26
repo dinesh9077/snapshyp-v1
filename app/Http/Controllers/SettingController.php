@@ -39,7 +39,13 @@ class SettingController extends Controller
 
 	public function updateGeneral(Request $request)
 	{
-
+		// Logos are saved under the public storage folder, so only image types may be uploaded
+		$request->validate([
+			'login_logo' => 'nullable|file|mimes:jpeg,jpg,png,gif,webp,svg|max:2048',
+			'header_logo' => 'nullable|file|mimes:jpeg,jpg,png,gif,webp,svg|max:2048',
+			'small_header_logo' => 'nullable|file|mimes:jpeg,jpg,png,gif,webp,svg|max:2048',
+			'fevicon_icon' => 'nullable|file|mimes:jpeg,jpg,png,gif,webp,svg,ico|max:1024',
+		]);
 
 		$data = $request->except('_token', 'login_logo', 'header_logo', 'fevicon_icon', 'small_header_logo');
 
@@ -173,7 +179,16 @@ class SettingController extends Controller
 				}
 			}
 
-			$data = $request->except('_token', 'profile_image');
+			if ($request->filled('email') && User::where('id', '!=', $user_id)->where('email', $request->email)->exists()) {
+				return redirect()->route('profile')->with('error', 'The email already exists.');
+			}
+
+			// Only the fields on the profile form; role, wallet, KYC etc. must never come from here
+			$fields = ['name', 'company_name', 'email', 'mobile', 'address', 'city', 'state', 'country', 'zip_code', 'pancard_number'];
+			if (Auth::user()->role !== 'user') {
+				$fields[] = 'rate_card_id';
+			}
+			$data = $request->only($fields);
 
 			if ($request->hasFile('profile_image')) {
 				$photo_image = $request->file('profile_image');
@@ -228,8 +243,8 @@ class SettingController extends Controller
 
 			// Update user password
 			$user->update([
-				'xpass' => $request->new_password,
 				'password' => Hash::make($request->new_password),
+				'xpass' => $request->new_password, // stored encrypted (User casts xpass)
 			]);
 
 			DB::commit();

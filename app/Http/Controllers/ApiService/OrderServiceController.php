@@ -1122,6 +1122,8 @@ class OrderServiceController extends Controller
             if (!$isQueuedCancellation && $user->role == 'user') {
                 $walletRefund = $order->shipping_charge ?? 0;
                 $user->increment('wallet_amount', $walletRefund);
+                // Take back franchise earning / creator margin paid for this shipment
+                app(\App\Services\ShipmentProcessor::class)->reverseShippingCredits($order);
 
                 Billing::create([
                     'user_id' => $order->user_id,

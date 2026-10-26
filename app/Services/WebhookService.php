@@ -170,7 +170,14 @@ class WebhookService
         $isSuccess = false;
 
         try {
+            // Re-checked at send time (DNS can change after the URL was saved)
+            if (!\App\Support\PublicUrl::isSafe($webhook->url)) {
+                throw new \RuntimeException('Webhook URL is not a public address; delivery blocked.');
+            }
+
             $response = Http::timeout(10)
+                // A redirect could point the request at an internal address
+                ->withOptions(['allow_redirects' => false])
                 ->withHeaders([
                     'Content-Type'        => 'application/json',
                     'X-Webhook-Event'     => $event,

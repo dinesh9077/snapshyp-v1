@@ -17,6 +17,7 @@ use App\Mail\OtpMail;
 use App\Models\Shop;
 use App\Models\LabelPreference;
 use App\Models\CodSetting;
+use App\Support\EmailOtp;
 
 class RegisterController extends Controller
 {
@@ -117,16 +118,21 @@ class RegisterController extends Controller
 
 			if (!isset($request->is_verify_otp) && $request->is_verify_otp == 0) {
 				Mail::to($request->email)->send(new OtpMail($request->name, $generatedOTP));
+				EmailOtp::issue($request->email, $generatedOTP);
 
 				return response()->json([
 					'status' => 'mail',
 					'msg'    => 'We have sent an OTP to your registered email address. Please check your inbox (and spam folder) and enter the OTP to continue.',
-					'uuid'    => base64_encode($generatedOTP)
 				]);
 			}
 
-
 			DB::beginTransaction();
+
+			// The account is created only after the OTP for this email was verified
+			if (!EmailOtp::consumeVerified($request->email)) {
+				DB::rollBack();
+				return response()->json(['status' => 'error', 'msg' => 'Please verify the OTP sent to your email first.']);
+			}
 
 			// Calculate next seller_id
 			$maxSellerId = User::max('seller_id');
@@ -142,8 +148,8 @@ class RegisterController extends Controller
 				'name' => $request->name,
 				'email' => $request->email,
 				'mobile' => $request->mobile,
-				'xpass' => $request->password,
 				'password' => Hash::make($request->password),
+				'xpass' => $request->password, // stored encrypted (User casts xpass)
 				'status' => 1,
 				'charge_type' => 1,
 				'charge' => 0,
@@ -205,17 +211,13 @@ class RegisterController extends Controller
 		return $token;
 	}
 
+	// Checked against user_otps; the browser never receives the OTP
 	public function verifyOTP(Request $request)
 	{
-		$otp = $request->input('otp');
-		$generatedOtp = $request->input('generatedOtp');
-
-		// Decode the generated OTP received from client (stored in localStorage)
-		$decodedGeneratedOtp = base64_decode($generatedOtp);
-
-		if ($decodedGeneratedOtp != $otp) {
+		if (!EmailOtp::verify((string) $request->input('email'), $request->input('otp'))) {
 			return response()->json(['status' => 'error', 'msg' => 'Invalid OTP, Please Try again.']);
 		}
+
 		return response()->json(['status' => 'success', 'msg' => 'OTP verified successfully']);
 	}
 
@@ -225,11 +227,11 @@ class RegisterController extends Controller
 
 		try {
 			Mail::to($request->email)->send(new OtpMail($request->name, $generatedOTP));
+			EmailOtp::issue($request->email, $generatedOTP);
 
 			return response()->json([
 				'status' => 'mail',
 				'msg'    => 'A new OTP has been sent to your email address. Please check your inbox (and spam folder) and enter the OTP to continue.',
-				'uuid'   => base64_encode($generatedOTP)
 			]);
 		} catch (\Exception $e) {
 

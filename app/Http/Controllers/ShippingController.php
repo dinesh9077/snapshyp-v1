@@ -1491,6 +1491,8 @@ class ShippingController extends Controller
 
 	public function storeShipping(Request $request)
 	{
+		// Courier companies hold the platform's API URLs and keys: admins only
+		abort_unless(Auth::user()->isAdminLevel(), 403);
 		$user_id = Auth::user()->id;
 		$data = $request->except('_token', 'logo');
 
@@ -1552,6 +1554,8 @@ class ShippingController extends Controller
 
 	public function updateShipping(Request $request)
 	{
+		// Courier companies hold the platform's API URLs and keys: admins only
+		abort_unless(Auth::user()->isAdminLevel(), 403);
 		$id = $request->id;
 		$data = $request->except('_token', 'id', 'logo');
 

@@ -19,6 +19,119 @@ class ShipmentProcessor
     private const STAFF_FRANCHISE_CHARGE_FIXED = 1;
     private const STAFF_FRANCHISE_CHARGE_PERCENTAGE = 2;
 
+    // Money fields always taken from the server-side quote, never from the request
+    private const QUOTED_PRICE_FIELDS = ['total_charges', 'freight_charges', 'cod_charges', 'tax', 'rto_charge', 'percentage_amount'];
+
+    /**
+     * Undo what shipping credited to others when a shipment is cancelled and the seller refunded:
+     * - franchise earning for this order (unless already in a withdrawal): debit and remove it,
+     *   so a later re-ship credits it again
+     * - creator margin ("Commission" billing): debit whatever is still credited for this order
+     */
+    public function reverseShippingCredits(Order $order): void
+    {
+        foreach (FranchiseEarning::where('order_id', $order->id)->whereNull('withdrawal_request_id')->get() as $earning) {
+            \App\Models\User::whereKey($earning->franchise_user_id)->decrement('wallet_amount', $earning->amount);
+            $earning->delete();
+        }
+
+        $netCommission = Billing::where('billing_type', 'Commission')
+            ->where('billing_type_id', $order->id)
+            ->selectRaw("user_id, SUM(CASE WHEN transaction_type = 'credit' THEN amount ELSE -amount END) AS net")
+            ->groupBy('user_id')
+            ->get();
+
+        foreach ($netCommission as $row) {
+            $net = round((float) $row->net, 2);
+            if ($net <= 0) {
+                continue;
+            }
+            \App\Models\User::whereKey($row->user_id)->decrement('wallet_amount', $net);
+            Billing::create([
+                'user_id' => $row->user_id,
+                'billing_type' => 'Commission',
+                'billing_type_id' => $order->id,
+                'transaction_type' => 'debit',
+                'amount' => $net,
+                'note' => 'Margin reversed, shipment cancelled for AWB: ' . ($order->awb_number ?? $order->order_prefix),
+            ]);
+        }
+    }
+
+    private function shipError(array $requestData, string $msg)
+    {
+        if (($requestData['is_bulk_shipment'] ?? 0) == 1) {
+            return ['status' => 'error', 'msg' => $msg];
+        }
+        return response()->json(['status' => 'error', 'msg' => $msg]);
+    }
+
+    // Same rule as OrderController::authorizeOrderAccess
+    private function actorCanShipOrder($actor, Order $order): bool
+    {
+        if ($actor->isMasterAdmin() || (int) $order->user_id === (int) $actor->id) {
+            return true;
+        }
+
+        return in_array(strtolower((string) $actor->role), ['admin', 'reseller', 'staff'], true)
+            && $order->user
+            && (int) $order->user->staff_id === (int) $actor->id;
+    }
+
+    // Quote the chosen courier for this order the same way the rate list (orderShipCharge) does
+    private function serverQuote(Order $order, ShippingCompany $shippingCompany, $courierId, $courierName): ?array
+    {
+        if (!$order->user || !$order->warehouse || !$order->customerAddress) {
+            return null;
+        }
+
+        $rateRequest = \Illuminate\Http\Request::create('/order/shipment/charge', 'POST', [
+            'qty' => [1],
+            'length' => [(string) ($order->length ?? 0)],
+            'width' => [(string) ($order->width ?? 0)],
+            'height' => [(string) ($order->height ?? 0)],
+            'volumdata' => [[
+                'length' => (string) ($order->length ?? 0),
+                'width' => (string) ($order->width ?? 0),
+                'height' => (string) ($order->height ?? 0),
+            ]],
+            'pickup_code' => (string) ($order->warehouse->zip_code ?? ''),
+            'delivery_code' => (string) ($order->customerAddress->zip_code ?? ''),
+            'weight' => (string) $order->weight,
+            'dimension_type' => $order->dimension_type ?? 'cm',
+            'payment_type' => strtoupper($order->order_type),
+            'cod_amount' => (string) ($order->cod_amount ?? 0),
+            'inv_amount' => (string) ($order->invoice_amount ?? 0),
+            'order_id' => $order->id,
+            'rov_type' => ($order->insurance_type == 1 ? 'ROV_OWNER' : 'ROV_CARRIER'),
+            'type_of_package' => $order->weight_order,
+            'orderItems' => $order->orderItems,
+        ]);
+
+        try {
+            $quotes = app(RateCardService::class)->getRate($order->user, $shippingCompany, $rateRequest, 1);
+        } catch (\Throwable $e) {
+            Log::warning('Ship now: could not re-quote courier', ['order_id' => $order->id, 'error' => $e->getMessage()]);
+            return null;
+        }
+
+        // A zero total means the rate API failed; never ship on that
+        $matches = array_values(array_filter((array) $quotes, function ($quote) use ($shippingCompany, $courierId) {
+            return is_array($quote)
+                && (int) ($quote['shipping_company_id'] ?? 0) === (int) $shippingCompany->id
+                && (float) ($quote['total_charges'] ?? 0) > 0
+                && (blank($courierId) || blank($quote['courier_id'] ?? null) || (string) $quote['courier_id'] === (string) $courierId);
+        }));
+
+        foreach ($matches as $quote) {
+            if ($courierName && ($quote['courier_name'] ?? null) === $courierName) {
+                return $quote;
+            }
+        }
+
+        return $matches[0] ?? null;
+    }
+
     public function orderShipNow($requestData)
     {
         $delhiveryB2CService = app(DelhiveryB2CService::class);
@@ -34,12 +147,21 @@ class ShipmentProcessor
         }
 
         $shippingCompany = ShippingCompany::findOrFail($requestData['shipping_company_id']);
-        $order = Order::with(['warehouse', 'customer', 'customerAddress', 'orderItems', 'user'])
+        // Row locks (callers run this inside a transaction): a double click or a parallel bulk
+        // job waits here, then sees the order as already shipped and the updated wallet
+        $order = Order::with(['warehouse', 'customer', 'customerAddress', 'orderItems'])
+            ->lockForUpdate()
             ->findOrFail($requestData['order_id']);
+        $order->setRelation('user', \App\Models\User::whereKey($order->user_id)->lockForUpdate()->first());
 
         $user = $order->user;
         $actorUserId = (int) ($requestData['actor_user_id'] ?? 0);
         $actorUser = $actorUserId > 0 ? \App\Models\User::find($actorUserId) : null;
+
+        // Whoever triggers the shipment must own the order (or manage its seller)
+        if ($actorUser && !$this->actorCanShipOrder($actorUser, $order)) {
+            return $this->shipError($requestData, 'Permission denied.');
+        }
 
         // Business rule (shared with manual create, API and bulk import): the order
         // must be COD or Prepaid before any courier shipment is booked. Checked here at
@@ -65,6 +187,18 @@ class ShipmentProcessor
                 'msg' => 'This shipping API is not assigned to this franchise seller.'
             ]);
         }
+
+        // Never trust prices sent by the client: re-quote this courier on the order owner's
+        // rate card and charge the server's numbers
+        $quote = $this->serverQuote($order, $shippingCompany, $requestData['courier_id'] ?? null, $requestData['courier_name'] ?? null);
+        if (!$quote) {
+            return $this->shipError($requestData, 'Could not confirm the shipping rate for this courier. Please check the rates again.');
+        }
+        unset($requestData['cod_charge'], $requestData['charge_cod'], $requestData['gst'], $requestData['base_freight']);
+        foreach (self::QUOTED_PRICE_FIELDS as $field) {
+            $requestData[$field] = $quote[$field] ?? 0;
+        }
+        $requestData['applicable_weight'] = $quote['applicable_weight'] ?? $quote['chargeable_weight'] ?? $order->weight;
 
         // Wallet validation
         if ($user->role === 'user') {

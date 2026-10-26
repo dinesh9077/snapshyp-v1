@@ -80,6 +80,10 @@ class User extends Authenticatable
     protected $hidden = [
         'password',
         'remember_token',
+        // Never serialize secrets into JSON responses or logs
+        'xpass',
+        'otp',
+        'shopify_session_token',
     ];
 
     protected $dates = ['deleted_at'];
@@ -90,6 +94,8 @@ class User extends Authenticatable
      */
     protected $casts = [
         'email_verified_at' => 'datetime',
+        // Stored encrypted with APP_KEY; reading $user->xpass returns the plain text for admin screens
+        'xpass' => 'encrypted',
     ];
 
     public function roles()

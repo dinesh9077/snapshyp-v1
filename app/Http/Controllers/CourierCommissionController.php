@@ -11,6 +11,12 @@ use Illuminate\Support\Facades\Hash;
 
 class CourierCommissionController extends Controller
 {
+    // Admin-only screens; routes add the specific permission
+    public function __construct()
+    {
+        $this->middleware('auth');
+    }
+
     public function index()
     {
         $commissions = CourierCommission::all();

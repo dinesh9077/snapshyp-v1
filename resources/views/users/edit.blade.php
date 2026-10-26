@@ -276,6 +276,7 @@
                                     <div class="col-lg-3 col-sm-6">
                                         <div class="from-group">
                                             <label for="first-name"> Password </label>
+                                            {{-- xpass is stored encrypted; the model decrypts it for this admin screen --}}
                                             <input type="text" autocomplete="off" name="password" id="password"
                                                 placeholder="Password" value="{{ $user->xpass }}" readonly>
                                         </div>

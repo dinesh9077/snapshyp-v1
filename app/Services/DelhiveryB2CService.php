@@ -198,8 +198,9 @@ class DelhiveryB2CService
 		$queryParam = [
 			'md' => $order->shipping_mode == 'Surface' ? 'S' : 'E',
 			'ss' => 'Delivered',
-			'd_pin' => $sourcePin,
-			'o_pin' => $consigneePin,
+			// o_pin = origin (warehouse), d_pin = destination (customer)
+			'o_pin' => $sourcePin,
+			'd_pin' => $consigneePin,
 			'cgm' => $totalWeightInKg * 1000,
 			'pt' => OrderType::isCod($order->order_type) ? 'COD' : 'Pre-paid',
 			'cod' => OrderType::isCod($order->order_type) ? $order->cod_amount : 0,
@@ -244,8 +245,9 @@ class DelhiveryB2CService
 		$queryParam = [
 			'md' => 'S',
 			'ss' => 'Delivered',
-			'd_pin' => $requestData['pickup_code'] ?? '',
-			'o_pin' => $requestData['delivery_code'] ?? '',
+			// o_pin = origin (pickup), d_pin = destination (delivery)
+			'o_pin' => $requestData['pickup_code'] ?? '',
+			'd_pin' => $requestData['delivery_code'] ?? '',
 			'cgm' => ($requestData['weight'] * 1000) ?? 0,
 			'pt' => OrderType::isCod($requestData['payment_type'] ?? '') ? 'COD' : 'Pre-paid',
 			'cod' => OrderType::isCod($requestData['payment_type'] ?? '') ? $requestData['cod_amount'] : 0,
@@ -592,11 +594,15 @@ class DelhiveryB2CService
 			'status' => $response->status()
 		]);
 
-		// Check if request was successful
-		if ($response->successful()) {
+		// A 2xx alone isn't enough: Delhivery reports refusals in the body ("status": false / "error")
+		$body = $response->json();
+		$bodyFailed = is_array($body)
+			&& ((array_key_exists('status', $body) && $body['status'] === false) || !empty($body['error']));
+
+		if ($response->successful() && !$bodyFailed) {
 			return [
 				'success' => true,
-				'response' => $response->json(),
+				'response' => $body,
 			];
 		}
 
