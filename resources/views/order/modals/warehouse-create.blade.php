@@ -11,13 +11,6 @@
                 @csrf
                 <div class="modal-body row">
 					
-					<div class="col-xl-12 col-md-12 col-sm-12">
-						<h4 class="mb-0"> 
-							<small class="text-muted d-block">
-								Note: If Delhivery API is activated, the address will be sent to the warehouse API to add it to the Delhivery portal.
-							</small>
-						</h4> 
-					</div> 
                 
                     <div class="col-xl-4 col-md-4 col-sm-12">
 						<div class="from-group my-2">

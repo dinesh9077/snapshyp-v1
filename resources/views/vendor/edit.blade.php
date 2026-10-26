@@ -71,9 +71,6 @@
                                     <div class="main-heading-1 pt-lg-0 pb-lg-2 px-lg-0">
                                        <h4 class="mb-0">
 											Address 
-											<small class="text-muted d-block">
-												Note: If Delhivery API is activated, the address will be sent to the warehouse Update API to add it to the Delhivery portal.
-											</small>
 										</h4> 
         							</div>
         							<div class="append_address">

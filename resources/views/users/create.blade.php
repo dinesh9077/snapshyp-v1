@@ -110,6 +110,19 @@
                                                 </select>
                                             </div>
                                         </div>
+                                        <div class="col-lg-3 col-sm-6">
+                                            <div class="from-group">
+                                                <label for="assigned_shipping_company_id"> Shadowfax Account </label>
+                                                <select class="form-control" name="assigned_shipping_company_id" id="assigned_shipping_company_id">
+                                                    <option value="">Default ({{ optional($courierAccounts->firstWhere('is_default', true))->name ?? 'none set' }})</option>
+                                                    @foreach ($courierAccounts as $account)
+                                                        <option value="{{ $account->id }}">
+                                                            {{ $account->name }}{{ $account->is_default ? ' (default)' : '' }}
+                                                        </option>
+                                                    @endforeach
+                                                </select>
+                                            </div>
+                                        </div>
                                         {{-- <div class="col-lg-3 col-sm-6">
                                             <div class="from-group">
                                                 <label for="first-name"> B2B Rate Card </label>

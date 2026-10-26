@@ -21,14 +21,6 @@
                             <div class="main-rowx-1">
                                 <div class="main-order-001">
                                     <div class="address_block">
-                                        <div class="main-heading-1 pt-lg-0 pb-lg-2 px-lg-0">
-                                            <h4 class="mb-0">
-                                                <small style="font-size : 14px; color : #727272; font-weight : 500;">
-                                                    Note: If Delhivery API is activated, the address will be sent to the
-                                                    warehouse API to add it to the Delhivery portal.
-                                                </small>
-                                            </h4>
-                                        </div>
                                         <div class="row align-items-end mt-3">
                                             <div class="col-xl-3 col-md-4 col-sm-6">
                                                 <div class="from-group my-2">

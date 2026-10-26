@@ -204,6 +204,12 @@
                 <span>Integrations</span>
             </a>
         </li>
+        <li>
+            <a href="{{ route('seller.weight-dimension.index') }}"
+                class="{{ request()->is('setting/weight-dimension*') ? 'active' : '' }}">
+                <span>Weight Dimension</span>
+            </a>
+        </li>
     </ul>
 </li>
 

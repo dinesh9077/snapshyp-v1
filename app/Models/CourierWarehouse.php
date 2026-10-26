@@ -13,7 +13,6 @@ class CourierWarehouse extends Model
         'user_id',
         'warehouse_name',
         'shipping_id',
-        'shipmozo_warehouse_id',
         'warehouse_status',
         'company_name',
         'contact_name',

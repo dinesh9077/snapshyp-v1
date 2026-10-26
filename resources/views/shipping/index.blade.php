@@ -72,6 +72,7 @@
 											<th>Sr.No.</th>
 											<th>Company Logo</th>
 											<th>Company Name</th>
+											<th>Provider</th>
 											<th>Url</th>
 											<th>Environment</th>
 											<th>Status</th>
@@ -92,7 +93,13 @@
 														<span>No Logo</span>
 													@endif
 												</td>
-												<td>{{ $shipping->name }}</td>
+												<td>
+													{{ $shipping->name }}
+													@if($shipping->is_default)
+														<span class="badge badge-primary ml-1" title="Sellers without an assigned account use this one">Default</span>
+													@endif
+												</td>
+												<td>{{ $shipping->providerLabel() }}</td>
 												<td>{{ $shipping->url }}</td>
 												<td>
 													<span
@@ -112,12 +119,10 @@
 														<a href="javascript:;" onclick="editShipping(this,event)"
 															data-id="{{ $shipping->id }}" data-name="{{ $shipping->name }}"
 															data-status="{{ $shipping->status }}"
-															data-api_key="{{ $shipping->api_key }}"
-															data-secret_key="{{ $shipping->secret_key }}"
+															@foreach (\App\Models\ShippingCompany::credentialFields() as $field => $label) data-{{ $field }}="{{ $shipping->$field }}" @endforeach
 															data-mode="{{ $shipping->mode }}"
-															data-url="{{ $shipping->url }}" data-email="{{ $shipping->email }}"
-															data-password="{{ $shipping->password }}"
-															data-tax="{{ $shipping->tax }}" class="class-pencil mr-1">
+															data-provider="{{ $shipping->provider }}"
+															data-is_default="{{ $shipping->is_default ? 1 : 0 }}" class="class-pencil mr-1">
 															<i class="mdi mdi-pencil "></i>
 														</a>
 														<a href="{{ route('shipping.company.manage-pincode', $shipping->id) }}"
@@ -176,42 +181,7 @@
 										required>
 								</div>
 							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Api Key/Token</label>
-									<input type="text" class="form-control" name="api_key" placeholder="Api Key/Token">
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Secret Key</label>
-									<input type="text" class="form-control" name="secret_key" placeholder="Secret Key">
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Email / Username</label>
-									<input type="text" class="form-control" name="email" placeholder="Email / Username">
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Password</label>
-									<input type="text" class="form-control" name="password" placeholder="Password">
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Url</label>
-									<input type="url" class="form-control" name="url" placeholder="Url" Required>
-								</div>
-							</div>
-							<div class="col-lg-6" style="display:none;">
-								<div class="from-group my-2">
-									<label for="order-id">Tax</label>
-									<input type="number" class="form-control" name="tax" placeholder="tax" value="0">
-								</div>
-							</div>
+							@include('shipping.partials.provider-fields', ['prefix' => 'create_', 'editing' => false])
 							<div class="col-lg-6">
 								<div class="from-group my-2">
 									<label for="order-id"> Environment Mode</label>
@@ -227,6 +197,15 @@
 									<select class="form-control" name="status" id="status" required>
 										<option value="1"> Active </option>
 										<option value="2"> In-Active </option>
+									</select>
+								</div>
+							</div>
+							<div class="col-lg-6">
+								<div class="from-group my-2">
+									<label for="is_default"> Default Account </label>
+									<select class="form-control" name="is_default" id="is_default">
+										<option value="0"> No </option>
+										<option value="1"> Yes (sellers without an assigned account use this) </option>
 									</select>
 								</div>
 							</div>
@@ -271,48 +250,7 @@
 								</div>
 								<input type="hidden" id="edit_id" name="id">
 							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id" id="label_edit_api_key">Api Key/Token</label>
-									<input type="text" class="form-control" id="edit_api_key" name="api_key"
-										placeholder="Api Key/Token">
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id" id="label_edit_secret_key">Secret Key</label>
-									<input type="text" class="form-control" id="edit_secret_key" name="secret_key"
-										placeholder="Secret Key">
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Email</label>
-									<input type="text" class="form-control" id="edit_email" name="email"
-										placeholder="Email">
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Password</label>
-									<input type="text" class="form-control" id="edit_password" name="password"
-										placeholder="Password">
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Url</label>
-									<input type="url" class="form-control" id="edit_url" name="url" placeholder="Url"
-										Required>
-								</div>
-							</div>
-							<div class="col-lg-6">
-								<div class="from-group my-2">
-									<label for="order-id">Tax</label>
-									<input type="number" class="form-control" id="edit_tax" name="tax" placeholder="tax"
-										value="0">
-								</div>
-							</div>
+							@include('shipping.partials.provider-fields', ['prefix' => 'edit_', 'editing' => true])
 							<div class="col-lg-6">
 								<div class="from-group my-2">
 									<label for="order-id"> Environment Mode</label>
@@ -328,6 +266,15 @@
 									<select class="form-control" name="status" id="edit_status" required>
 										<option value="1"> Active </option>
 										<option value="2"> In-Active </option>
+									</select>
+								</div>
+							</div>
+							<div class="col-lg-6">
+								<div class="from-group my-2">
+									<label for="edit_is_default"> Default Account </label>
+									<select class="form-control" name="is_default" id="edit_is_default">
+										<option value="0"> No </option>
+										<option value="1"> Yes (sellers without an assigned account use this) </option>
 									</select>
 								</div>
 							</div>
@@ -348,9 +295,36 @@
 
 		$('#shipping-datatable').DataTable();
 
+		const courierProviders = @json(\App\Models\ShippingCompany::PROVIDERS);
+
+		// Show only the credential fields the selected provider needs; hidden ones are disabled so they are not posted
+		function applyProviderFields($form) {
+			var provider = courierProviders[$form.find('.provider-select').val()];
+			$form.find('.provider-field').each(function() {
+				var field = $(this).data('field');
+				var label = provider ? provider.fields[field] : null;
+				var $input = $(this).find('input');
+				// Unknown (legacy) provider: keep every field editable, none required
+				$(this).toggle(!provider || !!label);
+				$input.prop('disabled', !!provider && !label).prop('required', !!label);
+				if (label) {
+					$(this).find('label').text(label);
+					$input.attr('placeholder', label);
+				}
+			});
+		}
+
+		$('#create_provider').on('change', function() {
+			var $form = $('#shippingStoreForm');
+			var provider = courierProviders[$(this).val()];
+			$form.find('[name="url"]').val(provider && provider.default_url ? provider.default_url : '');
+			applyProviderFields($form);
+		});
+
 		function createShipping(event) {
 			event.preventDefault();
 			$('#shippingStoreForm')[0].reset();
+			$('#create_provider').trigger('change');
 			$('#createShippingModal').modal('show');
 		}
 
@@ -362,55 +336,20 @@
 			var id = $obj.data('id');
 			var name = $obj.data('name');
 			var status = $obj.data('status');
-			var tax = $obj.data('tax');
-			var apiKey = $obj.data('api_key');
-			var secretKey = $obj.data('secret_key');
-			var email = $obj.data('email');
-			var password = $obj.data('password');
-			var url = $obj.data('url');
 			var mode = $obj.data('mode');
 
 			// Set the values in the form
 			$('#edit_id').val(id);
 			$('#edit_name').val(name);
-			$('#edit_api_key').val(apiKey);
-			$('#edit_secret_key').val(secretKey);
-			$('#edit_email').val(email);
-			$('#edit_password').val(password);
-			$('#edit_url').val(url);
+			$('#shippingEditForm .provider-field').each(function() {
+				var field = $(this).data('field');
+				$(this).find('input').val($obj.attr('data-' + field) || '');
+			});
 			$('#edit_mode').val(mode);
-			$('#edit_tax').val(tax);
+			$('#edit_is_default').val($obj.data('is_default') ? 1 : 0);
 			$('#edit_status').val(status);
-
-			if (id == 2) {
-				$('#label_edit_api_key').text('Api Key/Token - Public Key');
-				$('#edit_api_key').attr('placeholder', 'Api Key/Token - Public Key');
-				$('#label_edit_secret_key').text('Private Key');
-				$('#edit_secret_key').attr('placeholder', 'Private Key');
-				$('#edit_email').closest('.col-lg-6').find('label').text('Email');
-				$('#edit_email').attr('placeholder', 'Email');
-				$('#edit_secret_key').closest('.col-lg-6').show();
-				$('#edit_tax').closest('.col-lg-6').show();
-
-			} else if (id == 5) {
-				$('#label_edit_api_key').text('Api Key/Token');
-				$('#edit_api_key').attr('placeholder', 'Api Key/Token');
-				$('#label_edit_secret_key').text('Delhivery Client Name');
-				$('#edit_secret_key').attr('placeholder', 'Enter Client Name / Account Name');
-				$('#edit_email').closest('.col-lg-6').find('label').text('Username');
-				$('#edit_email').attr('placeholder', 'Username');
-				$('#edit_secret_key').closest('.col-lg-6').show();
-				$('#edit_tax').closest('.col-lg-6').show();
-			} else {
-				$('#label_edit_api_key').text('Api Key/Token');
-				$('#edit_api_key').attr('placeholder', 'Api Key/Token');
-				$('#label_edit_secret_key').text('Secret Key');
-				$('#edit_secret_key').attr('placeholder', 'Secret Key');
-				$('#edit_email').closest('.col-lg-6').find('label').text('Email');
-				$('#edit_email').attr('placeholder', 'Email');
-				$('#edit_secret_key').closest('.col-lg-6').show();
-				$('#edit_tax').closest('.col-lg-6').show();
-			}
+			$('#edit_provider').val($obj.data('provider') in courierProviders ? $obj.data('provider') : 'other');
+			applyProviderFields($('#shippingEditForm'));
 
 			// Show the modal
 			$('#editShippingModal').modal('show');

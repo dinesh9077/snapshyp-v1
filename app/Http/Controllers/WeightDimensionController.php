@@ -4,19 +4,84 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 
+use App\Models\User;
 use App\Models\WeightDimension;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
 
 class WeightDimensionController extends Controller
 {
     public function __construct()
     {
         $this->middleware('auth');
+        // The seller pages (setting/weight-dimension) are for sellers only: an admin there would
+        // otherwise reach the global slabs without the general_setting permission
+        $this->middleware(function ($request, $next) {
+            abort_if($request->is('setting/weight-dimension*') && !$this->isSeller(), 403);
+            return $next($request);
+        });
     }
 
     public function index()
     {
-        return view('weight-dimension.index');
+        abort_if($this->isSeller(), 403);
+        $sellers = $this->manageableSellers()->get(['id', 'name', 'company_name', 'default_package_weight']);
+        $isSellerPage = false;
+        return view('weight-dimension.index', compact('sellers', 'isSellerPage'));
+    }
+
+    // Seller's own page (Setting > Weight Dimension): only their slabs and default weight
+    public function sellerIndex()
+    {
+        abort_unless($this->isSeller(), 403);
+        $sellers = collect();
+        $isSellerPage = true;
+        $defaultWeight = Auth::user()->default_package_weight;
+        return view('weight-dimension.index', compact('sellers', 'isSellerPage', 'defaultWeight'));
+    }
+
+    private function isSeller(): bool
+    {
+        return Auth::user()->role === 'user';
+    }
+
+    // Sellers whose slabs this admin may manage: all for the master admin, else their own sellers
+    private function manageableSellers()
+    {
+        $user = Auth::user();
+        return User::where('role', 'user')
+            ->when(!$user->isMasterAdmin(), fn ($q) => $q->where('staff_id', $user->id))
+            ->orderBy('company_name');
+    }
+
+    // Requested seller id when it is one this admin manages; null = the global slabs
+    private function sellerScope(Request $request): ?int
+    {
+        // A seller always works on their own slabs, whatever the request says
+        if ($this->isSeller()) {
+            return (int) Auth::id();
+        }
+
+        $sellerId = (int) $request->input('user_id');
+        if ($sellerId <= 0) {
+            return null;
+        }
+        abort_unless($this->manageableSellers()->whereKey($sellerId)->exists(), 403);
+        return $sellerId;
+    }
+
+    // A slab row this admin may change: a global one, or one of their sellers'
+    private function findManageable($id): WeightDimension
+    {
+        $row = WeightDimension::findOrFail($id);
+        if ($this->isSeller()) {
+            // Sellers can change only their own slabs, never the global ones
+            abort_unless((int) $row->user_id === (int) Auth::id(), 403);
+        } elseif ($row->user_id) {
+            abort_unless($this->manageableSellers()->whereKey($row->user_id)->exists(), 403);
+        }
+        return $row;
     }
 
     public function getWeightDimensionAjax(Request $request)
@@ -37,7 +102,9 @@ class WeightDimensionController extends Controller
 
         $dir = $order_arr[0]['dir'];
 
-        $query = WeightDimension::query();
+        $sellerId = $this->sellerScope($request);
+        $query = WeightDimension::query()
+            ->when($sellerId, fn ($q) => $q->where('user_id', $sellerId), fn ($q) => $q->whereNull('user_id'));
 
         // Total records
         $totalData = $query->count();
@@ -99,8 +166,17 @@ class WeightDimensionController extends Controller
 
     public function store(Request $request)
     {
+        // An edited slab keeps its owner; a new one belongs to the seller picked on the page (or global)
+        $existing = $request->id ? $this->findManageable($request->id) : null;
+        $sellerId = $existing ? $existing->user_id : $this->sellerScope($request);
+
         $validator = Validator::make($request->all(), [
-            'slab' => 'required|unique:weight_dimensions,slab,' . $request->id,
+            'slab' => [
+                'required', 'numeric', 'gt:0',
+                Rule::unique('weight_dimensions', 'slab')
+                    ->where(fn ($q) => $sellerId ? $q->where('user_id', $sellerId) : $q->whereNull('user_id'))
+                    ->ignore($existing->id ?? null),
+            ],
             'length' => 'required|numeric',
             'width' => 'required|numeric',
             'height' => 'required|numeric',
@@ -111,8 +187,9 @@ class WeightDimensionController extends Controller
         }
 
         WeightDimension::updateOrCreate(
-            ['id' => $request->id],
+            ['id' => $existing->id ?? null],
             [
+                'user_id' => $sellerId,
                 'slab' => $request->slab,
                 'length' => $request->length,
                 'width' => $request->width,
@@ -124,12 +201,37 @@ class WeightDimensionController extends Controller
         return response()->json(['status' => 'success', 'msg' => 'Weight Dimension saved successfully.']);
     }
 
+    // Weight used for a seller's orders that arrive without one (Shopify products with no weight)
+    public function saveDefaultWeight(Request $request)
+    {
+        $sellerId = $this->sellerScope($request);
+        if (!$sellerId) {
+            return response()->json(['status' => 'error', 'msg' => 'Please select a seller.']);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'default_package_weight' => 'nullable|numeric|min:0|max:999',
+        ]);
+        if ($validator->fails()) {
+            return response()->json(['status' => 'error', 'msg' => $validator->errors()->first()]);
+        }
+
+        $weight = (float) $request->input('default_package_weight');
+        User::whereKey($sellerId)->update(['default_package_weight' => $weight > 0 ? $weight : null]);
+
+        return response()->json([
+            'status' => 'success',
+            'msg' => $weight > 0 ? 'Default weight saved.' : 'Default weight removed.',
+        ]);
+    }
+
     public function edit($id)
     {
-        $data = WeightDimension::find($id);
+        $data = $this->findManageable($id);
         return response()->json($data);
     }
 
+    // Order form auto-fill: the seller's own slab first, then the global one
     public function getBySlab(Request $request)
     {
         $slab = $request->get('slab');
@@ -137,7 +239,10 @@ class WeightDimensionController extends Controller
             return response()->json(['status' => 'error', 'msg' => 'Slab is required.']);
         }
 
-        $data = WeightDimension::where('slab', $slab)->where('status', 1)->first();
+        $user = Auth::user();
+        $sellerId = $user->role === 'user' ? (int) $user->id : (int) $request->get('user_id');
+
+        $data = WeightDimension::forWeight($sellerId ?: null, $slab, true);
         if ($data) {
             return response()->json(['status' => 'success', 'data' => $data]);
         }
@@ -147,8 +252,7 @@ class WeightDimensionController extends Controller
 
     public function destroy($id)
     {
-        WeightDimension::find($id)->delete();
+        $this->findManageable($id)->delete();
         return response()->json(['status' => 'success', 'msg' => 'Weight Dimension deleted successfully.']);
     }
 }
-

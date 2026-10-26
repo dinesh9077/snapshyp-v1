@@ -27,9 +27,9 @@ use Str;
 use App\Models\Notification;
 use App\Models\LabelPreference;
 use App\Services\{
-    DelhiveryB2CService,
-    DelhiveryService,
-    MasterService
+    BulkShipBatch,
+    MasterService,
+    RateCardService
 };
 use App\Jobs\ProcessBulkShipment;
 use App\Jobs\AppUninstalledJob;
@@ -38,15 +38,11 @@ use App\Support\EmailOtp;
 
 class ShopifyController extends Controller
 {
-    protected DelhiveryB2CService $delhiveryB2CService;
-    protected DelhiveryService $delhiveryService;
     protected MasterService $masterService;
     protected $settings;
     public function __construct()
     {
         error_reporting(0);
-        $this->delhiveryB2CService = new DelhiveryB2CService();
-        $this->delhiveryService = new DelhiveryService();
         $this->masterService = new MasterService();
         $this->settings = WhatsappSetting::getSettings();
     }
@@ -208,10 +204,17 @@ class ShopifyController extends Controller
 
     public function install(Request $request)
     {
-        $shop = $request->query('shop');
+        // Accept "mystore", "mystore.myshopify.com" or a pasted store URL; only real *.myshopify.com
+        // domains, so the OAuth redirect below can never point at another host
+        $shop = strtolower(trim((string) $request->query('shop')));
+        $shop = preg_replace('#^https?://#', '', $shop);
+        $shop = explode('/', $shop)[0];
+        if ($shop !== '' && !str_contains($shop, '.')) {
+            $shop .= '.myshopify.com';
+        }
 
-        if (!$shop) {
-            abort(400, 'Missing shop parameter');
+        if (!preg_match('/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/', $shop)) {
+            abort(400, 'Please enter a valid Shopify store (e.g. mystore.myshopify.com).');
         }
 
         $host = $request->query('host'); // Important for embedded app
@@ -565,12 +568,9 @@ class ShopifyController extends Controller
             $totalShippingCost = $orderData['total_shipping_price_set']['shop_money']['amount'] ?? 0;
             $tags = array_values(array_filter(array_map('trim', explode(',', $orderData['tags'] ?? ''))));
 
-            $totalWeight = $totalWeightInGrams > 0 ? ($totalWeightInGrams / 1000) : 0;
+            $totalWeight = $this->shopifyOrderWeight($totalWeightInGrams, $user_id);
             $warehouse = CourierWarehouse::where('user_id', $user_id)->where('warehouse_status', 1)->first();
-            $weightDimension = null;
-            if ($totalWeightInGrams > 0) {
-                $weightDimension = WeightDimension::where('slab', '>=', $totalWeight)->orderBy('slab', 'asc')->first();
-            }
+            $weightDimension = WeightDimension::forWeight((int) $user_id, $totalWeight);
 
             // Prepare Order Data
             $requestData = [];
@@ -681,6 +681,16 @@ class ShopifyController extends Controller
         } finally {
             $lock->release();
         }
+    }
+
+    // Shopify sends only total_weight (grams); products without a weight fall back to the seller's default
+    private function shopifyOrderWeight($totalWeightInGrams, $userId): float
+    {
+        $weight = (float) $totalWeightInGrams > 0 ? (float) $totalWeightInGrams / 1000 : 0.0;
+        if ($weight <= 0 && $userId) {
+            $weight = (float) (User::whereKey($userId)->value('default_package_weight') ?? 0);
+        }
+        return $weight;
     }
 
     public function sendWhatsAppMessage($order, $customerMobile)
@@ -936,29 +946,6 @@ class ShopifyController extends Controller
         return response('ok', 200);
     }
 
-    private function cancelCourierOrder($order, $shippingCompany)
-    {
-        $date = now()->toDateString();
-
-        switch ($shippingCompany->id) {
-            case 1:
-                $response = $this->delhiveryB2CService->cancelShipmentByAwbNumber($order->awb_number, $shippingCompany);
-                if (!($response['success'] ?? false))
-                    return null;
-                break;
-
-            default:
-                return null;
-        }
-
-        return [
-            'status_courier' => 'cancelled',
-            'order_cancel_date' => $date,
-            'reason_cancel' => "AWB {$order->awb_number} cancelled by courier",
-        ];
-    }
-
-
     public function billingCallback(Request $request)
     {
         $shop = $request->get('shop');
@@ -1009,7 +996,7 @@ class ShopifyController extends Controller
         $apiVersion = config('services.shopify_api_version');
         $mainOrderids = [];
         foreach ($orderIds as $shopifyOrderId) {
-            $existingOrder = Order::select('id')->where('shopify_order_number', $shopifyOrderId)->first();
+            $existingOrder = Order::select('id')->where('shopify_order_number', $shopifyOrderId)->where('user_id', $user->id)->first();
 
             if ($existingOrder) {
                 $mainOrderids[] = $existingOrder->id;
@@ -1109,13 +1096,10 @@ class ShopifyController extends Controller
                 $totalShippingCost = $orderData['total_shipping_price_set']['shop_money']['amount'] ?? 0;
                 $tags = array_values(array_filter(array_map('trim', explode(',', $orderData['tags'] ?? ''))));
 
-                $totalWeight = $totalWeightInGrams > 0 ? ($totalWeightInGrams / 1000) : 0;
+                $totalWeight = $this->shopifyOrderWeight($totalWeightInGrams, $user->id);
                 $warehouse = CourierWarehouse::where('user_id', $user_id)->where('warehouse_status', 1)->first();
 
-                $weightDimension = null;
-                if ($totalWeightInGrams > 0) {
-                    $weightDimension = WeightDimension::where('slab', '>=', $totalWeight)->orderBy('slab', 'asc')->first();
-                }
+                $weightDimension = WeightDimension::forWeight((int) $user->id, $totalWeight);
 
                 $orderCreate = [
                     'user_id' => $user->id,
@@ -1220,9 +1204,10 @@ class ShopifyController extends Controller
 
     public function shopifyOrderCreate(Request $request)
     {
-        $orderIds = explode(',', $request->query('order_ids', ''));
+        $orderIds = array_values(array_filter(explode(',', $request->query('order_ids', ''))));
 
-        $userId = $request->query('user_id');
+        // The shop's seller verified by ShopifyEmbeddedAuth (the user_id in the URL is not trusted)
+        $userId = Auth::id();
         $shop = $request->query('shop');
         //$shopifyOrderUrl = "https://{$shop}/admin/orders?inContextTimeframe=last_7_days";
 
@@ -1233,9 +1218,8 @@ class ShopifyController extends Controller
 
         $warehouses = CourierWarehouse::where('user_id', $userId)->where('warehouse_status', 1)->get();
 
-        $shipments = ShippingCompany::select('id', 'name')
-            ->where('status', 1)
-            ->get();
+        // The shop seller's courier account (assigned, else default)
+        $shipments = ShippingCompany::availableFor(User::find($userId))->map->only(['id', 'name'])->map(fn ($c) => (object) $c);
 
         return view('embedded.order-create', compact('orderIds', 'userId', 'warehouses', 'shipments'));
     }
@@ -1243,66 +1227,102 @@ class ShopifyController extends Controller
     public function orderShopifyBulkShipNow(Request $request)
     {
         $orderIds = $request->order_ids ? explode(',', $request->order_ids) : [];
-        // ✅ Validation (existing behavior)
-        if (empty($orderIds)) {
+        if (empty(array_filter($orderIds))) {
             return response()->json([
                 'status' => 'error',
                 'msg' => 'No orders selected. Please select at least one order to continue.',
             ]);
         }
 
-        try {
-
-            DB::beginTransaction();
-
-            // The shop's seller verified by ShopifyEmbeddedAuth, never a user_id from the request
-            $user = Auth::user();
-
-            if (!$user) {
-                DB::rollBack();
-                return response()->json([
-                    'status' => 'error',
-                    'msg' => 'Invalid user. Please try again.',
-                ]);
-            }
-
-            // Only this seller's own orders
-            $orderIds = array_values(array_unique(array_filter($orderIds)));
-            if (Order::whereIn('id', $orderIds)->where('user_id', $user->id)->count() !== count($orderIds)) {
-                DB::rollBack();
-                return response()->json([
-                    'status' => 'error',
-                    'msg' => 'You can only ship your own orders.',
-                ]);
-            }
-
-            $data = $request->all();
-            $data['is_shopify'] = null;
-
-            // ✅ Dispatch job to queue
-            ProcessBulkShipment::dispatch($orderIds, $data, $user);
-
-            // ✅ Update orders queue flag
-            Order::whereIn('id', $orderIds)
-                ->update(['queue' => 1, 'shipment_failure_reason' => null]);
-
-            DB::commit();
-
-            $companyName = config('setting.company_name');
-
-            return response()->json([
-                'status' => 'success',
-                'msg' => "Bulk shipment queued successfully. Processing will continue in the background — check the {$companyName} panel for status.",
-            ]);
-        } catch (\Exception $e) {
-
-            DB::rollBack();
-
-            return response()->json([
-                'status' => 'error',
-                'msg' => 'Something went wrong while processing bulk shipment. Please try again.',
-            ]);
+        // The shop's seller verified by ShopifyEmbeddedAuth, never a user_id from the request
+        $user = Auth::user();
+        if (!$user) {
+            return response()->json(['status' => 'error', 'msg' => 'Invalid user. Please try again.']);
         }
+
+        // Same rules as the web panel: only this seller's unshipped, not-already-queued orders are booked
+        $settings = $request->only(['warehouse_id', 'shipping_mode', 'courier_shipment_id', 'weight_order']);
+        $ownedOrders = Order::whereIn('id', $orderIds)->where('user_id', $user->id);
+
+        return response()->json(BulkShipBatch::queue($orderIds, $settings, $user, $ownedOrders, ['is_shopify' => null]));
+    }
+
+    // Live progress of a Shopify-app bulk run (same data as the web panel's popup)
+    public function shopifyBulkShipStatus($batchId)
+    {
+        $status = BulkShipBatch::status((string) $batchId, (int) Auth::id());
+        return $status ? response()->json($status) : response()->json(['status' => 'missing'], 404);
+    }
+
+    // Re-queue the failed orders of a run with the same warehouse, mode and courier
+    public function shopifyBulkShipRetry($batchId)
+    {
+        $user = Auth::user();
+        $settings = BulkShipBatch::settings((string) $batchId, (int) $user->id);
+        if ($settings === null) {
+            return response()->json(['status' => 'error', 'msg' => 'This bulk shipment was not found.'], 404);
+        }
+        $failedIds = BulkShipBatch::failedOrderIds((string) $batchId);
+        if (empty($failedIds)) {
+            return response()->json(['status' => 'error', 'msg' => 'There are no failed orders to retry.']);
+        }
+
+        $ownedOrders = Order::whereIn('id', $failedIds)->where('user_id', $user->id);
+        return response()->json(BulkShipBatch::queue($failedIds, $settings, $user, $ownedOrders, ['is_shopify' => null]));
+    }
+
+    /**
+     * Shipping charge per courier for the selected orders from the chosen warehouse, as the web
+     * panel's Ship Now shows it: total for the orders that have a rate, and which orders have none.
+     */
+    public function shopifyBulkShipQuote(Request $request, RateCardService $rateCardService)
+    {
+        $user = Auth::user();
+        $orderIds = array_values(array_filter(array_map('intval', explode(',', (string) $request->query('order_ids')))));
+        $orders = Order::with(['customerAddress', 'orderItems'])
+            ->whereIn('id', $orderIds)->where('user_id', $user->id)
+            ->whereNull('awb_number')
+            ->limit(50)
+            ->get();
+        $warehouse = CourierWarehouse::where('user_id', $user->id)->whereKey($request->query('warehouse_id'))->first();
+        if (!$warehouse || $orders->isEmpty()) {
+            return response()->json(['status' => 'success', 'couriers' => []]);
+        }
+
+        $couriers = [];
+        foreach (ShippingCompany::availableFor($user) as $company) {
+            $total = 0.0;
+            $missing = [];
+            foreach ($orders as $order) {
+                $quoteRequest = new Request([
+                    'pickup_code' => $warehouse->zip_code,
+                    'delivery_code' => $order->customerAddress->zip_code ?? '',
+                    'weight' => (string) $order->weight,
+                    'volumdata' => [['length' => (string) ($order->length ?? 0), 'width' => (string) ($order->width ?? 0), 'height' => (string) ($order->height ?? 0)]],
+                    'payment_type' => $order->order_type,
+                    'cod_amount' => (string) ($order->cod_amount ?? 0),
+                    'order_id' => $order->id,
+                    'type_of_package' => (int) ($order->weight_order ?: 1),
+                    'orderItems' => $order->orderItems,
+                ]);
+                $rates = (float) $order->weight > 0 ? $rateCardService->getRate($user, $company, $quoteRequest, 1) : null;
+                if (!empty($rates[0]['total_charges'])) {
+                    $total += (float) $rates[0]['total_charges'];
+                } else {
+                    $missing[] = '#' . $order->id . ((float) $order->weight > 0 ? '' : ' (no weight)');
+                }
+            }
+            $couriers[] = [
+                'id' => $company->id,
+                'name' => $company->name,
+                'total' => round($total, 2),
+                'priced' => $orders->count() - count($missing),
+                'orders' => $orders->count(),
+                'missing' => $missing,
+            ];
+        }
+
+        return response()->json(['status' => 'success', 'couriers' => $couriers]);
     }
 
     public function updateSync(Request $request)
@@ -1432,6 +1452,25 @@ class ShopifyController extends Controller
                 return $b['order_number'] - $a['order_number'];
             });
 
+            // Our side of each order (shipped from this app or the web panel): processing / shipped / failed
+            $ours = Order::where('user_id', Auth::id())
+                ->whereIn('shopify_order_number', array_column($orders, 'id'))
+                ->get(['id', 'shopify_order_number', 'awb_number', 'queue', 'status_courier', 'shipment_failure_reason'])
+                ->keyBy('shopify_order_number');
+            foreach ($orders as &$shopifyOrder) {
+                $own = $ours->get((string) $shopifyOrder['id']);
+                $shopifyOrder['snapshyp'] = $own ? [
+                    'order_id' => $own->id,
+                    'state' => !empty($own->awb_number)
+                        ? 'shipped'
+                        : ((int) $own->queue === 1 ? 'processing' : (!empty($own->shipment_failure_reason) ? 'failed' : 'new')),
+                    'awb' => $own->awb_number,
+                    'status' => $own->status_courier,
+                    'reason' => $own->shipment_failure_reason,
+                ] : null;
+            }
+            unset($shopifyOrder);
+
             return response()->json([
                 'status' => 'success',
                 'orders' => $orders
@@ -1473,8 +1512,9 @@ class ShopifyController extends Controller
             ], 404);
         }
 
-        // Find order by Shopify order ID
+        // Find order by Shopify order ID (only this shop seller's orders)
         $order = Order::where('shopify_order_number', $shopifyOrderId)
+            ->where('user_id', Auth::id())
             ->select('id', 'order_prefix', 'awb_number', 'status_courier')
             ->first();
 

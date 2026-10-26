@@ -25,8 +25,6 @@ use App\Models\{
 };
 use Maatwebsite\Excel\Facades\Excel;
 use PDF;
-use App\Services\ShipMozo;
-use App\Services\DelhiveryB2CService;
 use App\Services\RateCardService;
 use App\Imports\BulkOrder;
 use App\Support\OrderType;
@@ -35,8 +33,6 @@ use App\Jobs\ProcessBulkShipment;
 use App\Helpers\Helper;
 use DNS1D, DNS2D;
 use App\Exports\CodRemittanceExport;
-use App\Services\DelhiveryService;
-use App\Services\RoutxService;
 use App\Services\ShadowfaxService;
 use PhpOffice\PhpSpreadsheet\Shared\Date;
 use Illuminate\Support\Facades\Cache;
@@ -47,20 +43,12 @@ use App\Exports\OrderListingExport;
 
 class OrderController extends Controller
 {
-	protected $delhiveryB2CService;
-	protected $shipMozo;
 	protected $rateCardService;
-	protected $delhiveryService;
-	protected $routxService;
 	protected $shadowfaxService;
 	public function __construct()
 	{
 		$this->middleware('auth')->except(['orderLableGenerate']);
-		$this->shipMozo = new ShipMozo();
-		$this->delhiveryService = new DelhiveryService();
-		$this->delhiveryB2CService = new DelhiveryB2CService();
 		$this->rateCardService = new RateCardService();
-		$this->routxService = new RoutxService();
 		$this->shadowfaxService = new ShadowfaxService();
 	}
 
@@ -97,9 +85,10 @@ class OrderController extends Controller
 			});
 		}
 
-		$shipments = ShippingCompany::select('id', 'name')
-			->where('status', 1)
-			->get();
+		// Sellers see their own courier account; admins choose (the processor switches to each order owner's account)
+		$shipments = $authUser->role === 'user'
+			? ShippingCompany::availableFor($authUser)->map->only(['id', 'name'])->map(fn ($c) => (object) $c)
+			: ShippingCompany::select('id', 'name')->where('status', 1)->where('provider', '!=', 'other')->get();
 
 		$warehouses = CourierWarehouse::where('user_id', $authUser->id)->where('warehouse_status', 1)->get();
 
@@ -970,7 +959,7 @@ class OrderController extends Controller
 			if (!empty($order->shipping_company_id) && !empty($order->awb_number)) {
 				if (!in_array(strtolower($order->status_courier), ["cancelled", "new"])) {
 					$output .= "<a class='dropdown-item' href='" . url("order/tracking-history/{$order->id}") . "?weight_order=" . $weightOrder . "'> Tracking Order </a><hr class='m-0' />";
-					if (auth()->check() && auth()->user()->isMasterAdmin() && (int) $order->shipping_company_id !== 1) {
+					if (auth()->check() && auth()->user()->isMasterAdmin() && !\App\Models\ShippingCompany::isShadowfaxId($order->shipping_company_id)) {
 						$output .= "<a class='dropdown-item manual-status-update-trigger' href='javascript:;' data-id='{$order->id}' data-raw-status='{$order->status_courier}'> Manual Status Update </a><hr class='m-0' />";
 					}
 					// if ($order->shipping_company_id == 1) {
@@ -1719,7 +1708,7 @@ class OrderController extends Controller
 			return back()->with('error', 'Something went wrong');
 		}
 
-		if ($order->shippingCompany->id == 1) {
+		if ($order->shippingCompany->isShadowfax()) {
 			$response = $this->shadowfaxService->generateLabel($order->awb_number, $order->shippingCompany);
 
 			if ($response['success'] ?? false) {
@@ -1729,63 +1718,6 @@ class OrderController extends Controller
 				}
 			}
 			return back()->with('error', 'Label generation for Shadowfax failed or not found in response.');
-		} elseif (in_array($order->shippingCompany->id, [3, 4, 5])) {
-			$response = $this->delhiveryService->shippingLableByLrNo($order->lr_no, $order->shippingCompany);
-
-			if (!($response['success'] ?? false)) {
-				$errorMsg = $response['response']['errors'][0]['message'] ?? ($response['response']['error']['message'] ?? 'An error occurred.');
-				return back()->with('error', $errorMsg);
-			}
-
-			if ((isset($response['response']['success']) && !$response['response']['success'])) {
-				return back()->with('error', $response['response']['error']['message'] ?? 'An error occurred.');
-			}
-			if (!$response['response']['data']) {
-				return back()->with('error', 'Something went wrong');
-			}
-			$data = $response['response']['data'] ?? [];
-
-			// Fetch each label image and convert to Base64
-			$labels = [];
-			foreach ($data as $url) {
-				$response = $this->delhiveryService->getLabelImage($url);
-				if (isset($response['response']['success']) && $response['response']['success']) {
-					$labels[] = $response['response']['data'] ?? '';
-				}
-			}
-			return view('order.shipping-label', compact('labels', 'order'));
-		}
-		return back()->with('error', 'Something went wrong');
-	}
-
-	public function orderWayBillCopy($orderId)
-	{
-		$order = Order::with('shippingCompany')->find($orderId);
-		$this->authorizeOrderAccess($order);
-		if (!$order->shippingCompany || empty($order->awb_number)) {
-			return back()->with('error', 'Something went wrong');
-		}
-		if ($order->shippingCompany->id == 1) {
-			// Routx currently does not have a waybill endpoint in documentation.
-			return back()->with('error', 'Waybill copy for Routx is not available via API.');
-		} elseif (in_array($order->shippingCompany->id, [3, 4, 5])) {
-			$response = $this->delhiveryService->waybillCopyByLrNo($order->lr_no, $order->shippingCompany);
-
-			if (!($response['success'] ?? false)) {
-				$errorMsg = $response['response']['errors'][0]['message'] ?? ($response['response']['error']['message'] ?? 'An error occurred.');
-				return back()->with('error', $errorMsg);
-			}
-
-			if ((isset($response['response']['success']) && !$response['response']['success'])) {
-				return back()->with('error', $response['response']['error']['message'] ?? 'An error occurred.');
-			}
-			if (!$response['response']) {
-				return back()->with('error', 'Something went wrong');
-			}
-			return Response::make($response['response'], 200, [
-				'Content-Type' => 'application/pdf',
-				'Content-Disposition' => 'inline; filename="LR_Copy_' . $order->lr_no . '.pdf"'
-			]);
 		}
 		return back()->with('error', 'Something went wrong');
 	}
@@ -1824,76 +1756,6 @@ class OrderController extends Controller
 			'orderItems'
 		])->findOrFail($orderId);
 		$this->authorizeOrderAccess($order);
-
-		// Amazon ATS Label check
-		$isAmazonATS = false;
-		if (!empty($order->courier_name) && stripos($order->courier_name, 'Amazon ATS') !== false) {
-			$isAmazonATS = true;
-		}
-		if ($order->shippingCompany && stripos($order->shippingCompany->name ?? '', 'Amazon ATS') !== false) {
-			$isAmazonATS = true;
-		}
-
-		if ($isAmazonATS) {
-				if (empty($order->awb_number)) {
-				return back()->with('error', 'AWB Number is missing for Amazon ATS order.');
-			}
-
-			try {
-				// Fetch ShipMozo credentials (assuming ID 2 is ShipMozo)
-				$shipMozoCompany = ShippingCompany::find(2);
-				$headers = [];
-				if ($shipMozoCompany) {
-					$headers = [
-						'public-key' => $shipMozoCompany->api_key,
-						'private-key' => $shipMozoCompany->secret_key,
-						'Content-Type' => 'application/json',
-						'Accept' => 'application/json'
-					];
-				}
-
-				$response = Http::withHeaders($headers)
-					->get("https://shipping-api.com/app/api/v1/get-order-label/{$order->awb_number}");
-				$result = $response->json();
-
-				if (isset($result['result']) && $result['result'] == '1' && !empty($result['data'][0]['label'])) {
-					$labelImage = $result['data'][0]['label'];
-
-					// Use full page image for the label
-					$html = '<!DOCTYPE html><html><body style="margin:0;padding:0;"><img src="' . $labelImage . '" style="width:100%;height:auto;"></body></html>';
-
-					$preference = LabelPreference::where('user_id', $order->user_id)->first();
-					$paperSize = [0, 0, 288, 432]; // Default Thermal 4x6 (inches * 72)
-
-					if ($preference && $preference->label_size === 'desktop') {
-						$paperSize = 'letter';
-					}
-
-					return PDF::loadHtml($html)
-						->setPaper($paperSize, 'portrait')
-						->setOption('isHtml5ParserEnabled', true)
-						->setOption('isRemoteEnabled', true)
-						->download('order_label_' . $orderId . '.pdf');
-				} else {
-					return back()->with('error', 'Amazon ATS Label not found. ' . ($result['message'] ?? ''));
-				}
-			} catch (\Exception $e) {
-				return back()->with('error', 'Error fetching Amazon ATS Label: ' . $e->getMessage());
-			}
-		}
-
-		// UrbaneBolt Label Download
-		// if($order->shipping_company_id == 2) {
-		// 	$response = $this->urbaneBoltService->shippingLableByLrNo($order->awb_number, $order->shippingCompany);
-
-		// 	if ($response['success'] ?? false) {
-		// 		$labelUrl = $response['response']['link'] ?? ($response['response']['url'] ?? ($response['response']['label_url'] ?? null));
-
-		// 		if ($labelUrl) {
-		// 			return redirect($labelUrl);
-		// 		}
-		// 	}
-		// }
 
 		// Related data
 		$shipping = $order->shippingCompany ?? null;
@@ -1979,50 +1841,9 @@ class OrderController extends Controller
 			}
 
 			$htmlSections = [];
-			// Pre-fetch ShipMozo credentials for Amazon ATS orders
-			$shipMozoCompany = ShippingCompany::find(2);
 
 			foreach ($orders as $order) {
-				// Amazon ATS Label Check
-				$isAmazonATS = false;
-				if (!empty($order->courier_name) && stripos($order->courier_name, 'Amazon ATS') !== false) {
-					$isAmazonATS = true;
-				}
-				if ($order->shippingCompany && stripos($order->shippingCompany->name ?? '', 'Amazon ATS') !== false) {
-					$isAmazonATS = true;
-				}
-
-				if ($isAmazonATS) {
-					try {
-						$headers = [];
-						if ($shipMozoCompany) {
-							$headers = [
-								'public-key' => $shipMozoCompany->api_key,
-								'private-key' => $shipMozoCompany->secret_key,
-								'Content-Type' => 'application/json',
-								'Accept' => 'application/json'
-							];
-						}
-
-						if (!empty($order->awb_number)) {
-							$response = Http::withHeaders($headers)
-								->get("https://shipping-api.com/app/api/v1/get-order-label/{$order->awb_number}");
-							$result = $response->json();
-
-							if (isset($result['result']) && $result['result'] == '1' && !empty($result['data'][0]['label'])) {
-								$labelImage = $result['data'][0]['label'];
-								// Use full page image for the label
-								$html = '<!DOCTYPE html><html><body style="margin:0;padding:0;"><img src="' . $labelImage . '" style="width:100%;height:auto;"></body></html>';
-								$htmlSections[] = trim(preg_replace('/\s+/', ' ', $html));
-								continue;
-							}
-						}
-					} catch (\Exception $e) {
-						Log::error('Bulk Amazon ATS Label Error Order #' . $order->id . ': ' . $e->getMessage());
-					}
-				}
-
-				$shipping       = $order->shippingCompany;
+				$shipping      = $order->shippingCompany;
 				$customer       = $order->customer;
 				$customerAddr   = $order->customerAddress;
 				$products       = $order->orderItems;
@@ -2169,7 +1990,7 @@ class OrderController extends Controller
 			}
 
 			$orderCancelledData = [];
-			if ($shippingCompany->id == 1) {
+			if ($shippingCompany->isShadowfax()) {
 				$response = $this->shadowfaxService->cancel(
 					$order->awb_number,
 					$shippingCompany,
@@ -2186,30 +2007,13 @@ class OrderController extends Controller
 					'status_courier' => $isQueuedCancellation ? 'cancel requested' : 'cancelled',
 					'order_cancel_date' => now(),
 					'reason_cancel' => $response['message'] ?? "Shipment cancelled in Shadowfax for AWB: {$order->awb_number}.",
+					// Queued: cancel on Shopify once Shadowfax confirms (WebhookController)
+					'cancel_on_channel' => $isQueuedCancellation && request('cancel_on_channel') == 1,
 				];
 
 				if (!$isQueuedCancellation && request('cancel_on_channel') == 1) {
 					$this->cancelShopifyOrder($order);
 				}
-			} elseif (in_array($shippingCompany->id, [3, 4, 5])) {
-				$response = $this->delhiveryB2CService->cancelShipmentByAwbNumber($order->awb_number, $shippingCompany);
-
-				if (!($response['success'] ?? false)) {
-					$responseData = $response['response'] ?? [];
-					$errorMsg = is_array($responseData) ? ($responseData['errors'][0]['message'] ?? 'An error occurred.') : 'An error occurred.';
-					return back()->with('error', $errorMsg);
-				}
-
-				// Cancel on channel logic
-				if (request('cancel_on_channel') == 1) {
-					$this->cancelShopifyOrder($order);
-				}
-
-				$orderCancelledData = [
-					'status_courier' => 'cancelled',
-					'order_cancel_date' => now(),
-					'reason_cancel' => "For AWB number {$order->awb_number}, Shipment has been cancelled.",
-				];
 			}
 
 			if (!$orderCancelledData) {
@@ -2312,7 +2116,7 @@ class OrderController extends Controller
 		$expectedDeliveryDate = "N/A";
 		$epodData = null;
 		if (!empty($order->awb_number)) {
-			if ($shippingCompany->id == 1) {
+			if ($shippingCompany->isShadowfax()) {
 				$trackingResponse = $this->shadowfaxService->track($order->awb_number, $shippingCompany);
 
 				if (!($trackingResponse['success'] ?? false)) {
@@ -2345,7 +2149,7 @@ class OrderController extends Controller
 		}
 
 		$order = Order::with('shippingCompany')->findOrFail($id);
-		if (!$order->shippingCompany || (int) $order->shipping_company_id === 1) {
+		if (!$order->shippingCompany || \App\Models\ShippingCompany::isShadowfaxId($order->shipping_company_id)) {
 			return back()->with('error', 'Manual status update is allowed only for local shipping companies.');
 		}
 
@@ -2387,7 +2191,7 @@ class OrderController extends Controller
 		}
 
 		$order = Order::findOrFail($request->order_id);
-		if ((int) $order->shipping_company_id === 1) {
+		if (\App\Models\ShippingCompany::isShadowfaxId($order->shipping_company_id)) {
 			return response()->json(['status' => 'error', 'msg' => 'Status for this shipping company cannot be updated manually.']);
 		}
 
@@ -2423,7 +2227,7 @@ class OrderController extends Controller
 		if (!empty($order->awb_number)) {
 			$shippingCompany = $order->shippingCompany ?? null;
 
-			if ($shippingCompany && $shippingCompany->id == 1) {
+			if ($shippingCompany && $shippingCompany->isShadowfax()) {
 				$trackingResponse = $this->shadowfaxService->track($order->awb_number, $shippingCompany);
 
 				if ($trackingResponse['success'] ?? false) {
@@ -2526,8 +2330,8 @@ class OrderController extends Controller
 		// 	->unique()
 		// 	->toArray();
 
-		// Use the user who owns the order for rate calculation
-		$shippingCompanies = ShippingCompany::whereStatus(1)->get();
+		// Use the user who owns the order for rate calculation (their assigned account, else the default)
+		$shippingCompanies = ShippingCompany::availableFor($user);
 		$couriers = [];
 		$weight = $order->weight;
 
@@ -2560,69 +2364,6 @@ class OrderController extends Controller
 				$couriers = array_merge($couriers, $response);
 			}
 		}
-			// if ($shippingCompany->id == 1) {
-			// 	$pincodeServiceData = $this->delhiveryB2CService->pincodeService($order->customerAddress->zip_code ?? '', $shippingCompany);
-
-			// 	if (
-			// 		!($pincodeServiceData['success'] ?? false) ||
-			// 		(isset($pincodeServiceData['response']['success']) && !$pincodeServiceData['response']['success'])
-			// 	) {
-			// 		continue;
-			// 	}
-
-			// 	$response = $this->delhiveryB2CService->freightEstimate($order, $shippingCompany);
-
-			// 	if (
-			// 		!($response['success'] ?? false) ||
-			// 		(isset($response['response']['success']) && !$response['response']['success'])
-			// 	) {
-			// 		continue;
-			// 	}
-
-			// 	$responseData = $response['response'] ?? [];
-			// 	if (!$responseData) {
-			// 		continue;
-			// 	}
-
-			// 	foreach ($responseData as $responseValue) {
-			// 		$taxData = $responseValue['tax_data'] ? array_sum($responseValue['tax_data']) : 0;
-			// 		$totalAmount = $responseValue['charge_DL'] ?? 0;
-			// 		$chargeDph = $responseValue['charge_DPH'] ?? 0;
-			// 		$chargeCod = $responseValue['charge_COD'] ?? 0;
-			// 		$chargeRto = $responseValue['charge_RTO'] ?? 0;
-
-			// 		$totalCharges = $taxData + $totalAmount + $chargeDph + $chargeCod;
-
-			// 		$percentageAmount = ($role === "user" && $charge > 0)
-			// 			? ($charge_type == 1 ? $charge : ($totalCharges * $charge) / 100)
-			// 			: 0;
-			// 		$totalCharges += $percentageAmount;
-
-			// 		$tax = $shippingCompany->tax > 0 ? (($totalCharges * $shippingCompany->tax) / 100) : 0;
-			// 		$roundedTotalCharges = round($totalCharges + $tax);
-			// 		$roundOffAmount = $roundedTotalCharges - ($totalCharges + $tax);
-
-			// 		$couriers[] = [
-			// 			'direct_rate' => $totalAmount ?? 0,
-			// 			'order_id' => $orderId,
-			// 			'tax' => $tax,
-			// 			'round_off' => $roundOffAmount,
-			// 			'shipping_company_id' => $shippingCompany->id,
-			// 			'shipping_company_name' => $shippingCompany->name,
-			// 			'shipping_company_logo' => asset('storage/shipping-logo/' . $shippingCompany->logo),
-			// 			'courier_id' => '',
-			// 			'courier_name' => "{$shippingCompany->name} {$order->shipping_mode}",
-			// 			'freight_charges' => ($totalAmount + $chargeDph),
-			// 			'cod_charges' => $chargeCod,
-			// 			'total_charges' => $roundedTotalCharges,
-			// 			'rto_charge' => $chargeRto,
-			// 			'min_weight' => ($responseValue['charged_weight'] / 1000),
-			// 			'chargeable_weight' => max($volumetricWt, $weight) ?? 0,
-			// 			'applicable_weight' =>  max($volumetricWt, $weight) ?? 0,
-			// 			'percentage_amount' => $percentageAmount,
-			// 			'responseData' => $responseValue
-			// 		];
-			// 	}
 
 		$couriers = $couriers ? collect($couriers)->sortBy('total_charges') : collect();
 
@@ -3814,33 +3555,42 @@ class OrderController extends Controller
 		}
 
 		$user = Auth::user();
-		$data = $request->all();
-		$data['is_shopify'] = 0;
+		$settings = $request->except('_token', 'order_ids');
 
-		try {
+		return $this->queueBulkShipment($orderIds, $settings, $user);
+	}
 
-			DB::beginTransaction();
+	// Queue a tracked bulk run (same rules as the Shopify app): only orders this user may ship
+	private function queueBulkShipment(array $orderIds, array $settings, $user)
+	{
+		$ownedOrders = $this->applyOwnershipScope(Order::whereIn('id', $orderIds), $user);
+		return response()->json(\App\Services\BulkShipBatch::queue($orderIds, $settings, $user, $ownedOrders, ['is_shopify' => 0]));
+	}
 
-			ProcessBulkShipment::dispatch($orderIds, $data, $user);
-
-			Order::whereIn('id', $orderIds)
-				->update(['queue' => 1, 'shipment_failure_reason' => null]);
-
-			DB::commit();
-
-			return response()->json([
-				'status' => 'success',
-				'msg'    => 'Bulk shipment queued successfully. Processing will continue in the background.',
-			]);
-		} catch (\Exception $e) {
-
-			DB::rollBack();
-
-			return response()->json([
-				'status' => 'error',
-				'msg'    => 'Something went wrong while queuing the bulk shipment. Please try again.',
-			]);
+	// Live progress of a bulk ship run (polled by the order page popup)
+	public function orderBulkShipStatus($batchId)
+	{
+		$status = \App\Services\BulkShipBatch::status((string) $batchId, (int) Auth::id());
+		if (!$status) {
+			return response()->json(['status' => 'missing'], 404);
 		}
+		return response()->json($status);
+	}
+
+	// Re-queue only the failed orders of a finished run, with the same courier and mode
+	public function orderBulkShipRetry($batchId)
+	{
+		$user = Auth::user();
+		$settings = \App\Services\BulkShipBatch::settings((string) $batchId, (int) $user->id);
+		if ($settings === null) {
+			return response()->json(['status' => 'error', 'msg' => 'This bulk shipment was not found.'], 404);
+		}
+		$failedIds = \App\Services\BulkShipBatch::failedOrderIds((string) $batchId);
+		if (empty($failedIds)) {
+			return response()->json(['status' => 'error', 'msg' => 'There are no failed orders to retry.']);
+		}
+
+		return $this->queueBulkShipment($failedIds, $settings, $user);
 	}
 
 	public function orderBulkCancel(Request $request)
@@ -4015,7 +3765,7 @@ class OrderController extends Controller
 
 				// attempt cancellation based on courier
 				try {
-					if ($shippingCompany->id == 1) {
+					if ($shippingCompany->isShadowfax()) {
 						$attempted++;
 						$response = $this->shadowfaxService->cancel(
 							$order->awb_number,
@@ -4038,24 +3788,8 @@ class OrderController extends Controller
 							'status_courier' => $isQueuedCancellation ? 'cancel requested' : 'cancelled',
 							'order_cancel_date' => now()->toDateString(),
 							'reason_cancel' => $response['message'] ?? "Shipment cancelled in Shadowfax for AWB: {$order->awb_number}.",
-						];
-					} elseif (in_array($shippingCompany->id, [3, 4, 5])) {
-						$attempted++;
-						$response = $this->delhiveryB2CService->cancelShipmentByAwbNumber($order->awb_number, $shippingCompany);
-						if (!($response['success'] ?? false)) {
-							$errors++;
-							continue;
-						}
-
-						// Cancel on channel logic for bulk
-						if ($cancelOnChannel == 1) {
-							$this->cancelShopifyOrder($order);
-						}
-
-						$orderCancelledData = [
-							'status_courier' => 'cancelled',
-							'order_cancel_date' => now()->toDateString(),
-							'reason_cancel' => "For AWB number {$order->awb_number}, Shipment has been cancelled.",
+							// Queued: cancel on Shopify once Shadowfax confirms (WebhookController)
+							'cancel_on_channel' => $isQueuedCancellation && $cancelOnChannel == 1,
 						];
 					}
 				} catch (\Throwable $ex) {
@@ -4141,26 +3875,10 @@ class OrderController extends Controller
 		];
 	}
 
+	// Shipped orders are unfulfilled on Shopify first, then cancelled (no refund); see ShopifyOrderSync
 	private function cancelShopifyOrder($order)
 	{
-		if ($order->is_platform_order == 1 && $order->platform_source == 'shopify') {
-			$user = User::find($order->user_id);
-			if ($user && $user->role == 'user' && $user->shop) {
-				$shop = Shop::where('shopify_domain', $user->shop)->first();
-				if ($shop && $order->platform_order_number) {
-				    $shopifyToken = $shop->getValidShopifyToken();
-					$apiVersion = config('services.shopify_api_version', '2023-01');
-					$response = Http::withHeaders([
-						'X-Shopify-Access-Token' => $shopifyToken,
-						'Content-Type' => 'application/json',
-					])->post("https://{$user->shop}/admin/api/{$apiVersion}/orders/{$order->platform_order_number}/cancel.json");
-
-					if ($response->failed()) {
-						Log::error("Failed to cancel Shopify order: {$order->platform_order_number}", $response->json());
-					}
-				}
-			}
-		}
+		return app(\App\Services\ShopifyOrderSync::class)->cancel($order);
 	}
 
 	public function orderBulkSyncChannel(Request $request)

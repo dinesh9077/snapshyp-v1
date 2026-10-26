@@ -106,7 +106,7 @@ class FulfillShopifyOrder
                 'lineItemsByFulfillmentOrder' => $lineItemsByFO,
                 'trackingInfo' => [
                     'number' => (string) $trackingNumber ?? 'TRACK' . rand(10000, 99999),
-                    'company' => $trackingCompany ?? 'Delhivery'
+                    'company' => $trackingCompany ?? 'Shadowfax'
                 ],
                 'notifyCustomer' => false
             ]
@@ -127,7 +127,7 @@ class FulfillShopifyOrder
     {
         // Map company IDs to names
         $mapping = [
-            1  => 'Delhivery'
+            1  => 'Shadowfax'
         ];
 
         // Return mapped name or null if not found

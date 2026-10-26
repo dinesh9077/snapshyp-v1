@@ -30,13 +30,8 @@ use App\Models\{
 use App\Exports\PendingStarOrderExport;
 use Maatwebsite\Excel\Facades\Excel;
 use PDF;
-use App\Services\ShipMozo;
-use App\Services\DelhiveryService;
-use App\Services\DelhiveryB2CService;
 use App\Services\RateCardService;
 use App\Services\ShipmentProcessor;
-use App\Services\UrbaneBoltService;
-use App\Services\RoutxService;
 use App\Services\ShadowfaxService;
 use App\Imports\BulkOrder;
 use App\Traits\ApiResponse;
@@ -50,13 +45,8 @@ class OrderController extends Controller
 {
 	use ApiResponse;
 
-	protected $delhiveryService;
-	protected $shipMozo;
-	protected $delhiveryB2CService;
 	protected $rateCardService;
 	protected $shipmentProcessor;
-	protected $urbaneBoltService;
-	protected $routxService;
 	protected $shadowfaxService;
 
 	// Endpoints that take an order id: the caller must own the order (same rule as the web panel)
@@ -76,15 +66,8 @@ class OrderController extends Controller
 			return $next($request);
 		})->only(self::OWNED_ORDER_METHODS);
 
-		$this->shipMozo = new ShipMozo();
-		$this->delhiveryService = new DelhiveryService();
-		$this->delhiveryB2CService = new DelhiveryB2CService();
 		$this->rateCardService = new RateCardService();
 		$this->shipmentProcessor = new ShipmentProcessor();
-		$this->urbaneBoltService = class_exists(UrbaneBoltService::class)
-			? new UrbaneBoltService()
-			: null;
-		$this->routxService = new RoutxService();
 		$this->shadowfaxService = new ShadowfaxService();
 	}
 
@@ -1057,29 +1040,11 @@ class OrderController extends Controller
 		if (!empty($order->awb_number)) {
 			$shippingCompany = $order->shippingCompany ?? null;
 
-			if (($shippingCompany && $shippingCompany->id == 1)) {
+			if ($shippingCompany && $shippingCompany->isShadowfax()) {
 				$trackingResponse = $this->shadowfaxService->track($order->awb_number, $shippingCompany);
 
 				if ($trackingResponse['success'] ?? false) {
 					$trackingHistories = $trackingResponse['legacy_history'] ?? [];
-				}
-			} elseif (($shippingCompany && $shippingCompany->id == 2) && $this->urbaneBoltService) {
-				$trackingResponse = $this->urbaneBoltService->trackOrderByAwbNo($order->awb_number, $shippingCompany);
-				if ($trackingResponse['success'] ?? false) {
-					$resp = $trackingResponse['response'];
-					if (isset($resp['data']) && is_array($resp['data'])) {
-						$respDetails = $resp['data'];
-						$trackingHistories = $respDetails['scans'] ?? ($respDetails['shipment_track'] ?? ($respDetails['history'] ?? []));
-					} else {
-						$trackingHistories = $resp['scans'] ?? ($resp['shipment_track'] ?? ($resp['data'] ?? ($resp['history'] ?? [])));
-					}
-
-					if (strtolower($order->status_courier) == 'delivered') {
-						$epodResponse = $this->urbaneBoltService->getEpod($order->awb_number, $shippingCompany);
-						if ($epodResponse['success'] ?? false) {
-							$epodData = $epodResponse['response'];
-						}
-					}
 				}
 			}
 		}
@@ -1146,7 +1111,7 @@ class OrderController extends Controller
 			}
 
 			$orderCancelledData = [];
-			if ($shippingCompany->id == 1) {
+			if ($shippingCompany->isShadowfax()) {
 				$response = $this->shadowfaxService->cancel(
 					$order->awb_number,
 					$shippingCompany,
@@ -1164,23 +1129,6 @@ class OrderController extends Controller
 					'status_courier' => $isQueuedCancellation ? 'cancel requested' : 'cancelled',
 					'order_cancel_date' => now(),
 					'reason_cancel' => $response['message'] ?? "Shipment cancelled in Shadowfax for AWB: {$order->awb_number}.",
-				];
-			} elseif ($shippingCompany->id == 2) {
-				if (!$this->urbaneBoltService) {
-					return $this->errorResponse('UrbaneBolt service is not configured.');
-				}
-
-				$response = $this->urbaneBoltService->cancelShipmentByAwbNo($order->awb_number, $shippingCompany);
-
-				if (!($response['success'] ?? false)) {
-					$errorMsg = $response['response']['message'] ?? 'An error occurred during cancellation.';
-					return $this->errorResponse($errorMsg);
-				}
-
-				$orderCancelledData = [
-					'status_courier' => 'cancelled',
-					'order_cancel_date' => now(),
-					'reason_cancel' => "For AWB number {$order->awb_number}, Shipment has been cancelled.",
 				];
 			}
 
@@ -1283,37 +1231,12 @@ class OrderController extends Controller
 			], 'Incomplete order data');
 		}
 
-		$shippingCompanies = ShippingCompany::whereStatus(1)->get();
+		// The order owner's courier accounts (assigned, else default)
+		$shippingCompanies = ShippingCompany::availableFor($order->user ?? $user ?? null);
 		$couriers = [];
 
 		foreach ($shippingCompanies as $shippingCompany) {
-			if ($shippingCompany->id == 1) {
-				$requestData = new Request();
-				$volumdata = [
-					[
-						'length' => $order->length ?? 0,
-						'width' => $order->width ?? 0,
-						'height' => $order->height ?? 0,
-					]
-				];
-
-				$requestData->merge([
-					'volumdata' => $volumdata,
-					'pickup_code' => $order->warehouse->zip_code,
-					'delivery_code' => $order->customerAddress->zip_code,
-					'weight' => $order->weight,
-					'payment_type' => $order->order_type,
-					'cod_amount' => $order->cod_amount,
-					'order_id' => $orderId,
-					'type_of_package' => $order->weight_order,
-					'orderItems' => $order->orderItems,
-				]);
-
-				$response = $this->rateCardService->getRate($user, $shippingCompany, $requestData, $isOrder = 1);
-				if ($response && is_array($response)) {
-					$couriers[] = $response;
-				}
-			} elseif ($shippingCompany->id == 2) {
+			if ($shippingCompany->isShadowfax()) {
 				$requestData = new Request();
 				$volumdata = [
 					[
@@ -1387,7 +1310,7 @@ class OrderController extends Controller
 		$epodData = null;
 
 		if (!empty($order->awb_number)) {
-			if ($shippingCompany->id == 1) {
+			if ($shippingCompany->isShadowfax()) {
 				$trackingResponse = $this->shadowfaxService->track($order->awb_number, $shippingCompany);
 
 				if (!($trackingResponse['success'] ?? false)) {
@@ -1428,68 +1351,6 @@ class OrderController extends Controller
 			$products = $order->orderItems ?? null;
 			$hideLabel = $order->warehouse ? $order->warehouse->label_options : [];
 			$preference = LabelPreference::where('user_id', $order->user_id)->first();
-
-			// Amazon ATS Label check
-			$isAmazonATS = false;
-			if (!empty($order->courier_name) && stripos($order->courier_name, 'Amazon ATS') !== false) {
-				$isAmazonATS = true;
-			}
-			if ($shipping && stripos($shipping->name ?? '', 'Amazon ATS') !== false) {
-				$isAmazonATS = true;
-			}
-
-			if ($isAmazonATS) {
-				if (empty($order->awb_number)) {
-					return $this->errorResponse('AWB Number is missing for Amazon ATS order.');
-				}
-
-				try {
-					$shipMozoCompany = ShippingCompany::find(2);
-					$headers = [];
-					if ($shipMozoCompany) {
-						$headers = [
-							'public-key' => $shipMozoCompany->api_key,
-							'private-key' => $shipMozoCompany->secret_key,
-							'Content-Type' => 'application/json',
-							'Accept' => 'application/json'
-						];
-					}
-
-					$response = Http::withHeaders($headers)
-						->get("https://shipping-api.com/app/api/v1/get-order-label/{$order->awb_number}");
-					$result = $response->json();
-
-					if (isset($result['result']) && $result['result'] == '1' && !empty($result['data'][0]['label'])) {
-						$labelImage = $result['data'][0]['label'];
-						$html = '<!DOCTYPE html><html><body style="margin:0;padding:0;"><img src="' . $labelImage . '" style="width:100%;height:auto;"></body></html>';
-
-						$paperSize = [0, 0, 288, 432];
-						if ($preference && $preference->label_size === 'desktop') {
-							$paperSize = 'letter';
-						}
-
-						$pdf = PDF::loadHtml($html)
-							->setPaper($paperSize, 'portrait')
-							->setOption('isHtml5ParserEnabled', true)
-							->setOption('isRemoteEnabled', true);
-
-						// For API, save it to public storage and return URL
-						$fileName = 'order_label_' . $orderId . '_' . time() . '.pdf';
-						$filePath = 'exports/' . $fileName;
-						Storage::disk('public')->put($filePath, $pdf->output());
-
-						return $this->successResponse([
-							'download_url' => asset('storage/' . $filePath),
-							'file_name' => $fileName
-						], 'Label generated successfully.');
-
-					} else {
-						return $this->errorResponse('Amazon ATS Label not found. ' . ($result['message'] ?? ''));
-					}
-				} catch (\Exception $e) {
-					return $this->errorResponse('Error fetching Amazon ATS Label: ' . $e->getMessage());
-				}
-			}
 
 			// Generate barcodes safely
 			$barcodePng = !empty($order->awb_number) ? DNS2D::getBarcodePNG($order->awb_number, 'QRCODE', 6, 6) : '';

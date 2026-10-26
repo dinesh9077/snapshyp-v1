@@ -29,7 +29,6 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
-use App\Services\ShipMozo;
 use App\Services\MasterService;
 use File;
 use PDF;
@@ -38,12 +37,10 @@ class CommonController extends Controller
 {
 	use ApiResponse;
 
-	protected $shipMozo;
 	protected $rateCardService;
 
 	public function __construct()
 	{
-		$this->shipMozo = new ShipMozo();
 		$this->rateCardService = \App\Services\RateCardService::class;
 		// Actually, standard is new Class() or injection.
 		// Since ShippingController uses `new RateCardService()`, we will do the same.
@@ -543,7 +540,8 @@ class CommonController extends Controller
 
 		$extraData = ['zipcodes' => $zipcodes];
 
-		$shippingCompanies = ShippingCompany::whereStatus(1)->get(['id', 'name']);
+		// The seller's courier account(s): assigned, else default
+		$shippingCompanies = ShippingCompany::availableFor($user);
 		$serviceable = [];
 		$reasons = [];
 

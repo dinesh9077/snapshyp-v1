@@ -30,8 +30,6 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
-use App\Services\ShipMozo;
-use App\Services\DelhiveryB2CService;
 use App\Services\RateCardService;
 use Carbon\Carbon;
 use Helper;
@@ -44,16 +42,11 @@ use Maatwebsite\Excel\Excel as ExcelWriter;
 class ShippingController extends Controller
 {
 
-	protected $delhiveryService;
-	protected $delhiveryB2CService;
-	protected $shipMozo;
 	protected $rateCardService;
 
 	public function __construct()
 	{
 		$this->middleware('auth');
-		$this->shipMozo = new ShipMozo();
-		$this->delhiveryB2CService = new DelhiveryB2CService();
 		$this->rateCardService = new RateCardService();
 	}
 
@@ -1049,29 +1042,32 @@ class ShippingController extends Controller
 			});
 		}
 
-		if ($filterPickup !== '') {
-			if ($filterPickup === 'not_selected') {
-				$query->where(function ($q) {
-					$q->whereNull('scp_from.service_mode')
-						->orWhere('scp_from.service_mode', '');
-				});
-			} else {
-				$query->where('scp_from.service_mode', $filterPickup);
-			}
-		}
-
-		if ($filterDelivery !== '') {
-			if ($filterDelivery === 'not_selected') {
-				$query->where(function ($q) {
-					$q->whereNull('scp_to.service_mode')
-						->orWhere('scp_to.service_mode', '');
-				});
-			} else {
-				$query->where('scp_to.service_mode', $filterDelivery);
-			}
-		}
+		$this->applyServiceModeFilter($query, 'scp_from.service_mode', $filterPickup, ['drop', 'no_pickup']);
+		$this->applyServiceModeFilter($query, 'scp_to.service_mode', $filterDelivery, ['pickup', 'no_delivery']);
 
 		return $query;
+	}
+
+	// Same meaning as the summary counts: a pincode with no row (or 'door') is serviceable
+	private function applyServiceModeFilter($query, string $column, string $filter, array $notServiceableModes): void
+	{
+		if ($filter === '') {
+			return;
+		}
+
+		if ($filter === 'not_selected') {
+			$query->where(function ($q) use ($column) {
+				$q->whereNull($column)->orWhere($column, '');
+			});
+		} elseif ($filter === 'door') {
+			$query->where(function ($q) use ($column, $notServiceableModes) {
+				$q->whereNull($column)->orWhereNotIn($column, $notServiceableModes);
+			});
+		} elseif (in_array($filter, $notServiceableModes, true)) {
+			$query->whereIn($column, $notServiceableModes);
+		} else {
+			$query->where($column, $filter);
+		}
 	}
 
 	private function getManagePincodeSummary(int $shippingCompanyId): array
@@ -1495,12 +1491,16 @@ class ShippingController extends Controller
 		abort_unless(Auth::user()->isAdminLevel(), 403);
 		$user_id = Auth::user()->id;
 		$data = $request->except('_token', 'logo');
+		$data = $this->normalizeCourierAccountFields($data, true);
+		if (!$data['provider']) {
+			return redirect()->route('shipping.company')->with('error', 'Please select a supported provider.');
+		}
 
 		$data['user_id'] = $user_id;
 		$data['created_at'] = Carbon::now();
 		$data['updated_at'] = Carbon::now();
 
-		$path_avatar = "storage/app/public/shipping-logo";
+		$path_avatar = storage_path("app/public/shipping-logo");
 		if (!File::isDirectory($path_avatar)) {
 			File::makeDirectory($path_avatar, 0777, true, true);
 		}
@@ -1508,9 +1508,10 @@ class ShippingController extends Controller
 		try {
 			if ($request->hasFile('logo')) {
 				$photo_image = $request->file('logo');
-				$extension = $photo_image->getClientOriginalExtension();
+				$extension = strtolower($photo_image->getClientOriginalExtension());
 				if (in_array($extension, ['png', 'jpeg', 'jpg'])) {
-					$getAvatar = strtolower($request->name) . '.' . $extension;
+					// Fresh name per upload so browsers never keep showing the previous (cached) logo
+					$getAvatar = \Illuminate\Support\Str::slug($request->name) . '-' . time() . '.' . $extension;
 					$filename = $path_avatar . "/" . $getAvatar;
 					$photo_image->move($path_avatar, $getAvatar);
 					$data['logo'] = $getAvatar;
@@ -1524,24 +1525,12 @@ class ShippingController extends Controller
 			}
 
 			$shippingCompany = ShippingCompany::create($data);
+			$this->keepSingleDefaultAccount($shippingCompany);
 			$this->syncDefaultB2CZonesForShippingCompany($shippingCompany->id);
 			$this->syncDefaultB2BZonesForShippingCompany($shippingCompany->id);
 			$this->syncDefaultShippingWeightsForShippingCompany($shippingCompany->id);
 
-			// Automatically generate token for ID 5
-			if ($shippingCompany->id == 5) {
-				$delhiveryService = new \App\Services\DelhiveryService();
-				$delhiveryService->getToken($shippingCompany);
-			}
-
-			// Only Delhivery (ID=1) and ShipMozo (ID=2) are supported
-			if ($shippingCompany->id == 1) {
-				$successMsg = 'The shipping company has been successfully added.';
-			} elseif ($shippingCompany->id == 2) {
-				$successMsg = 'The ShipMozo company has been successfully added.';
-			} else {
-				$successMsg = 'The shipping company has been successfully added.';
-			}
+			$successMsg = 'The shipping company has been successfully added.';
 
 			DB::commit();
 
@@ -1552,16 +1541,41 @@ class ShippingController extends Controller
 		}
 	}
 
+	// Provider is picked once at creation (orders and rates hang off it); is_default is a plain 0/1
+	private function normalizeCourierAccountFields(array $data, bool $creating): array
+	{
+		if ($creating) {
+			$data['provider'] = array_key_exists($data['provider'] ?? '', ShippingCompany::PROVIDERS) ? $data['provider'] : null;
+		} else {
+			unset($data['provider']);
+		}
+		if (array_key_exists('is_default', $data)) {
+			$data['is_default'] = (int) $data['is_default'] === 1;
+		}
+		return $data;
+	}
+
+	// Only one default account per courier: the newly marked one wins
+	private function keepSingleDefaultAccount(ShippingCompany $shippingCompany): void
+	{
+		if ($shippingCompany->is_default) {
+			ShippingCompany::where('provider', $shippingCompany->provider)
+				->where('id', '!=', $shippingCompany->id)
+				->update(['is_default' => false]);
+		}
+	}
+
 	public function updateShipping(Request $request)
 	{
 		// Courier companies hold the platform's API URLs and keys: admins only
 		abort_unless(Auth::user()->isAdminLevel(), 403);
 		$id = $request->id;
 		$data = $request->except('_token', 'id', 'logo');
+		$data = $this->normalizeCourierAccountFields($data, false);
 
 		$data['updated_at'] = Carbon::now();
 
-		$path_avatar = "storage/app/public/shipping-logo";
+		$path_avatar = storage_path("app/public/shipping-logo");
 		if (!File::isDirectory($path_avatar)) {
 			File::makeDirectory($path_avatar, 0777, true, true);
 		}
@@ -1569,9 +1583,10 @@ class ShippingController extends Controller
 		try {
 			if ($request->hasFile('logo')) {
 				$photo_image = $request->file('logo');
-				$extension = $photo_image->getClientOriginalExtension();
+				$extension = strtolower($photo_image->getClientOriginalExtension());
 				if (in_array($extension, ['png', 'jpeg', 'jpg'])) {
-					$getAvatar = strtolower($request->name) . '.' . $extension;
+					// Fresh name per upload so browsers never keep showing the previous (cached) logo
+					$getAvatar = \Illuminate\Support\Str::slug($request->name) . '-' . time() . '.' . $extension;
 					$filename = $path_avatar . "/" . $getAvatar;
 					$photo_image->move($path_avatar, $getAvatar);
 					$data['logo'] = $getAvatar;
@@ -1586,33 +1601,12 @@ class ShippingController extends Controller
 
 			$shippingCompany = ShippingCompany::findOrFail($id);
 			$shippingCompany->update($data);
+			$this->keepSingleDefaultAccount($shippingCompany);
 			$this->syncDefaultB2CZonesForShippingCompany($shippingCompany->id);
 			$this->syncDefaultB2BZonesForShippingCompany($shippingCompany->id);
 			$this->syncDefaultShippingWeightsForShippingCompany($shippingCompany->id);
 
-			// Automatically refresh token for ID 5
-			if ($id == 5) {
-				$delhiveryService = new \App\Services\DelhiveryService();
-				$tokenData = $delhiveryService->getToken($shippingCompany);
-				if (isset($tokenData['success']) && $tokenData['success']) {
-					$token = $tokenData['response']['data']['jwt'] ?? null;
-					if ($token) {
-						$shippingCompany->update([
-							'api_key' => $token,
-							'expired_at' => \Carbon\Carbon::now()->addHours(23)
-						]);
-					}
-				}
-			}
-
-			// Only Delhivery (ID=1) and ShipMozo (ID=2) are supported
-			if ($id == 1) {
-				$successMsg = 'The shipping company has been updated successfully.';
-			} elseif ($id == 2) {
-				$successMsg = 'The ShipMozo company has been updated successfully.';
-			} else {
-				$successMsg = 'The shipping company has been updated successfully.';
-			}
+			$successMsg = 'The shipping company has been updated successfully.';
 
 			DB::commit();
 
@@ -2200,7 +2194,7 @@ class ShippingController extends Controller
 		$data['created_at'] = date('Y-m-d H:i:s');
 		$data['updated_at'] = date('Y-m-d H:i:s');
 
-		$path_avatar = "storage/app/public/packaging";
+		$path_avatar = storage_path("app/public/packaging");
 
 		if (!File::isDirectory($path_avatar)) {
 			File::makeDirectory($path_avatar, 0777, true, true);
@@ -2240,7 +2234,7 @@ class ShippingController extends Controller
 		$data['user_id'] = $user_id;
 		$data['updated_at'] = date('Y-m-d H:i:s');
 
-		$path_avatar = "storage/app/public/packaging";
+		$path_avatar = storage_path("app/public/packaging");
 
 		if (!File::isDirectory($path_avatar)) {
 			File::makeDirectory($path_avatar, 0777, true, true);
@@ -2290,6 +2284,10 @@ class ShippingController extends Controller
 			$selectedShippingCompany = ShippingCompany::where('id', $requestedCompanyId)
 				->where('status', 1)
 				->first();
+			// Sellers may open only their own courier account here
+			if ($selectedShippingCompany && $user->role === 'user' && !ShippingCompany::isAvailableFor($user, $selectedShippingCompany->id)) {
+				$selectedShippingCompany = null;
+			}
 		}
 
 		if ($selectedShippingCompany) {
@@ -2370,7 +2368,12 @@ class ShippingController extends Controller
 			// 	->unique()
 			// 	->toArray();
 
+			// Sellers quote only their own courier account; admins may quote any active account
+			$allowedIds = $user->role === 'user' ? ShippingCompany::availableFor($user)->pluck('id') : null;
 			$shippingCompanies = ShippingCompany::whereStatus(1)
+				->when($allowedIds !== null, function ($query) use ($allowedIds) {
+					$query->whereIn('id', $allowedIds);
+				})
 				->when($requestedCompanyId > 0, function ($query) use ($requestedCompanyId) {
 					$query->where('id', $requestedCompanyId);
 				})
@@ -2533,8 +2536,8 @@ class ShippingController extends Controller
 			return $fallback->heading ?: $fallback->zone_name;
 		}
 
-		// Last resort for priority couriers (1: Shadowfax, 3: Delhivery)
-		if (in_array($shippingCompanyId, [1, 3])) {
+		// Last resort for the priority courier (1: Shadowfax)
+		if ((int) $shippingCompanyId === 1) {
 			$lastResort = ZoneSetting::where('shipping_company_id', $shippingCompanyId)
 				->orderBy('sort_order', 'asc')
 				->first();
@@ -2606,33 +2609,12 @@ class ShippingController extends Controller
 
 	private function isActiveCompanyPincode(int $shippingCompanyId, string $pincode, string $direction): bool
 	{
-		if ($shippingCompanyId <= 0 || !preg_match('/^\d{6}$/', $pincode)) {
+		if (!preg_match('/^\d{6}$/', $pincode)) {
 			return false;
 		}
 
-		$zip = Zipcode::where('pincode', $pincode)->first();
-		if (!$zip) return false;
-
-		// If NO mappings exist for this company/direction, consider it serviceable everywhere (Global)
-		$hasMappingsForDirection = ShippingCompanyPincode::where('shipping_company_id', $shippingCompanyId)
-			->where('direction', $direction)
-			->exists();
-
-		if (!$hasMappingsForDirection) {
-			return true;
-		}
-
-		$scp = ShippingCompanyPincode::where('shipping_company_id', $shippingCompanyId)
-			->where('pincode_id', $zip->id)
-			->where('direction', $direction)
-			->first();
-
-		// MATCH DASHBOARD LOGIC: Serviceable if no record exists OR record is set to 'door'/empty/none
-		if (!$scp || in_array($scp->service_mode, ['', 'none', 'door'])) {
-			return true;
-		}
-
-		return false;
+		// One Manage Pincode rule for the calculator, the pincode check and order quotes
+		return $this->rateCardService->isPincodeServiceable($shippingCompanyId, $pincode, $direction);
 	}
 
 	private function calculateCalculatorVolumetricWeight(Request $request): float
@@ -2725,7 +2707,10 @@ class ShippingController extends Controller
 		// 1. It has NO mappings in shipping_company_pincodes (global support)
 		// OR
 		// 2. It has a mapping for this pincode/direction with service_mode = 'door'
-		$activeCompanies = ShippingCompany::where('status', 1)->get();
+		// Serviceability through the caller's courier account(s)
+		$activeCompanies = Auth::check() && Auth::user()->role === 'user'
+			? ShippingCompany::availableFor(Auth::user())
+			: ShippingCompany::where('status', 1)->where('provider', '!=', 'other')->get();
 		$isServiceable = false;
 
 		$supportingCouriers = [];
@@ -4286,6 +4271,10 @@ class ShippingController extends Controller
 				->when(!empty($availableCompanyIds), function ($query) use ($availableCompanyIds) {
 					$query->whereIn('id', $availableCompanyIds);
 				})
+				// A seller sees only their own courier account (assigned, else the default)
+				->when($user->role === 'user', function ($query) use ($user) {
+					$query->whereIn('id', ShippingCompany::availableFor($user)->pluck('id'));
+				})
 				->get();
 			$currentCompanyId = $shippingCompanies->contains('id', $requestedCompanyId)
 				? $requestedCompanyId
@@ -4449,6 +4438,10 @@ class ShippingController extends Controller
 				->where('status', 1)
 				->when(!empty($availableCompanyIds), function ($query) use ($availableCompanyIds) {
 					$query->whereIn('id', $availableCompanyIds);
+				})
+				// A seller sees only their own courier account (assigned, else the default)
+				->when($user->role === 'user', function ($query) use ($user) {
+					$query->whereIn('id', ShippingCompany::availableFor($user)->pluck('id'));
 				})
 				->get();
 			if (!$shippingCompanies->contains('id', $currentCompanyId)) {

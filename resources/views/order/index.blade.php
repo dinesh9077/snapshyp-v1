@@ -306,7 +306,7 @@ td p {
                         @if ($status === 'Ready To Ship')
                         <button id="bulkSchedulePickup" class="btn-main-1" style="display:none;">
                             <i class="mdi mdi-calendar-clock me-1"></i> Schedule Pickup
-                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Request a courier pickup for the selected Delhivery or ShipMozo shipments."></i>
+                            <i class="mdi mdi-information-outline btn-info-tip" data-toggle="tooltip" data-placement="bottom" title="Request a courier pickup for the selected Shadowfax shipments."></i>
                         </button>
                         @endif
                         @endif
@@ -823,7 +823,7 @@ td p {
                         <select name="shipping_company_id" class="form-control select2" required>
                             <option value="">Select Shipping Company</option>
                             @foreach ($shipments as $shippingCompany)
-                            @if($shippingCompany->id == 1 || $shippingCompany->id == 2)
+                            @if($shippingCompany->id == 1)
                             <option value="{{ $shippingCompany->id }}">{{ $shippingCompany->name }}</option>
                             @endif
                             @endforeach
@@ -935,6 +935,7 @@ $columns[] = ['data' => 'action'];
 @endphp
 @endsection
 @push('js')
+@include('order.partials.bulk-ship-progress')
 <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/fancybox/3.5.7/jquery.fancybox.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
@@ -1261,7 +1262,14 @@ $(document).ready(function() {
 
                 stopLoading($submitBulkButton);
 
-                if (res.status === "success") {
+                if (res.status === "success" && res.batch_id) {
+                    // Show live progress once the ship modal has closed (two modals mid-transition fight over the backdrop)
+                    $('#shipBulkModal').one('hidden.bs.modal', function() {
+                        window.bulkShipProgress.start(res.batch_id);
+                    }).modal('hide');
+                    $('.order-checkbox, #checkAll').prop('checked', false);
+                    $('#bulkShipmentOrder, #bulkShipmentCancel').hide();
+                } else if (res.status === "success") {
                     $('#shipBulkModal').modal('hide');
                     toastrMsg(res.status, res.msg);
 
@@ -1971,18 +1979,18 @@ $(document).on('click', '#bulkShipmentCancel', function(e) {
 $(document).on('click', '#bulkSchedulePickup', function(e) {
     e.preventDefault();
     let selectedOrderIds = [];
-    let nonDelhiverySelected = false;
+    let nonEligibleSelected = false;
 
     let firstValidCompanyId = null;
     let currentCompanyId = null;
 
     $('.order-checkbox:checked').each(function() {
         let companyId = $(this).attr('data-shipping-company-id');
-        if (companyId == '1' || companyId == '2') {
+        if (companyId == '1') {
             if (!firstValidCompanyId) firstValidCompanyId = companyId;
             selectedOrderIds.push($(this).val());
         } else {
-            nonDelhiverySelected = true;
+            nonEligibleSelected = true;
         }
     });
 
@@ -1990,18 +1998,18 @@ $(document).on('click', '#bulkSchedulePickup', function(e) {
         Swal.fire({
             icon: 'warning',
             title: 'Invalid Selection!',
-            text: nonDelhiverySelected ?
-                'Pickup scheduling is only supported for Delhivery and ShipMozo orders. Please select Delhivery or ShipMozo orders only.' :
+            text: nonEligibleSelected ?
+                'Pickup scheduling is only supported for Shadowfax orders. Please select Shadowfax orders only.' :
                 'Please select at least one order to schedule pickup.',
         });
         return;
     }
 
-    if (nonDelhiverySelected) {
+    if (nonEligibleSelected) {
         Swal.fire({
             icon: 'info',
             title: 'Partial Selection',
-            text: 'Some selected orders are not from Delhivery/ShipMozo and will be excluded from the pickup request. Proceed with ' +
+            text: 'Some selected orders are not from Shadowfax and will be excluded from the pickup request. Proceed with ' +
                 selectedOrderIds.length + ' eligible orders?',
             showCancelButton: true,
             confirmButtonText: 'Yes, Proceed',
@@ -2018,7 +2026,7 @@ $(document).on('click', '#bulkSchedulePickup', function(e) {
 
 function showPickupModal(ids, defaultCompanyId) {
     $('#selected_order_ids').val(ids.join(','));
-    // Pre-select based on first valid order, default to Delhivery (1)
+    // Pre-select based on first valid order, default to Shadowfax (1)
     let companyIdToSelect = defaultCompanyId || '1';
     $('#bulkSchedulePickupModal select[name="shipping_company_id"]').val(companyIdToSelect).trigger('change');
     $('#bulkSchedulePickupModal').modal('show');

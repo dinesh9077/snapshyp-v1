@@ -49,7 +49,7 @@ class SettingController extends Controller
 
 		$data = $request->except('_token', 'login_logo', 'header_logo', 'fevicon_icon', 'small_header_logo');
 
-		$path_avatar = "storage/app/public/settings";
+		$path_avatar = storage_path("app/public/settings");
 
 
 

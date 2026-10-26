@@ -5,7 +5,6 @@ namespace App\Helpers;
 use App\Models\Order;
 use App\Models\OrderActivity;
 use Ixudra\Curl\Facades\Curl;
-use App\Models\ShippingCompany;
 use App\Models\VendorAddress;
 use App\Models\Vendor;
 use Illuminate\Support\Facades\DB;
@@ -272,38 +271,6 @@ class Helper
 	public static function orderActivity($id, $activity_name)
 	{
 		return  OrderActivity::insert(['order_id' => $id, 'activity_name' => $activity_name, 'date' => date('Y-m-d'), 'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s')]);
-	}
-
-	public static function xpressBeesToken($id)
-	{
-		$shipping = ShippingCompany::find($id);
-		$token = $shipping->api_key;
-		if ($shipping->id == 1) {
-			if (empty($shipping->expired_at) || $shipping->hasExpired()) {
-				$response = Curl::to($shipping->url . 'api/users/login')
-					->withData(array('email' => $shipping->email, 'password' => $shipping->password))
-					->asJson(true)
-					->post();
-				ShippingCompany::whereId($id)->update(['api_key' => $response['data'], 'expired_at' => date('Y-m-d H:i:s')]);
-				$token = $response['data'];
-			} else {
-				$token = $shipping->api_key;
-			}
-		}
-		if ($shipping->id == 4) {
-			if (empty($shipping->expired_at) || $shipping->hasExpired()) {
-				$response = Curl::to($shipping->url . 'auth/login')
-					->withData(array('email' => $shipping->email, 'password' => $shipping->password, 'vendorType' => "SELLER"))
-					->asJson(true)
-					->post();
-
-				ShippingCompany::whereId($id)->update(['api_key' => $response['data']['accessToken'], 'expired_at' => date('Y-m-d H:i:s')]);
-				$token = $response['data']['accessToken'];
-			} else {
-				$token = $shipping->api_key;
-			}
-		}
-		return $token;
 	}
 
 	public static function callCurlApi($url, $dataArray, $token)

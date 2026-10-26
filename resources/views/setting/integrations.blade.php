@@ -80,10 +80,16 @@
                                     </p>
                                 </div>
                                 <div class="intage-card-footer">
-                                    <a href="">
-                                        Connect Store
-                                        <i class="mdi mdi-arrow-top-right"></i>
-                                    </a>
+                                    <div class="d-flex justify-content-between align-items-center w-100">
+                                        <a href="javascript:void(0)" data-toggle="modal" data-target="#shopifyInstallModal">
+                                            Install on my store
+                                            <i class="mdi mdi-arrow-top-right"></i>
+                                        </a>
+                                        <a href="{{ config('services.shopify_app_store_url') }}" target="_blank" rel="noopener"
+                                            class="small text-muted" title="Open the Snapshyp listing on the Shopify App Store">
+                                            App Store
+                                        </a>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -140,4 +146,55 @@
             </div>
         </div>
     </div>
+    {{-- Direct install: our /install route sends the seller to their store's Shopify approval screen --}}
+    <div class="modal fade" id="shopifyInstallModal" tabindex="-1" role="dialog" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Install on your Shopify store</h5>
+                    <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                        <i class="mdi mdi-close"></i>
+                    </button>
+                </div>
+                <form id="shopifyInstallForm" action="{{ route('shopify.install') }}" method="get" target="_blank">
+                    <div class="modal-body">
+                        <label for="shopify_store" class="mb-1">Store address</label>
+                        <div class="input-group">
+                            <input type="text" class="form-control" id="shopify_store" name="shop" required
+                                placeholder="mystore" value="{{ str_replace('.myshopify.com', '', (string) auth()->user()->shop) }}"
+                                autocomplete="off">
+                            <div class="input-group-append">
+                                <span class="input-group-text">.myshopify.com</span>
+                            </div>
+                        </div>
+                        <small class="text-muted d-block mt-2">
+                            Find it in Shopify admin → Settings → Domains (the <b>.myshopify.com</b> address). You will
+                            approve the app on Shopify, then log in to {{ config('setting.company_name') }} inside the app.
+                        </small>
+                    </div>
+                    <div class="modal-footer">
+                        <a href="{{ config('services.shopify_app_store_url') }}" target="_blank" rel="noopener" class="mr-auto small">
+                            Or install from the App Store
+                        </a>
+                        <button type="submit" class="btn-main-1">Install</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
 @endsection
+
+@push('js')
+    <script>
+        // Accept "mystore", "mystore.myshopify.com" or a pasted store URL
+        $('#shopifyInstallForm').on('submit', function() {
+            let store = $.trim($('#shopify_store').val()).toLowerCase()
+                .replace(/^https?:\/\//, '').split('/')[0];
+            if (store && store.indexOf('.') === -1) {
+                store += '.myshopify.com';
+            }
+            $('#shopify_store').val(store);
+            $('#shopifyInstallModal').modal('hide');
+        });
+    </script>
+@endpush

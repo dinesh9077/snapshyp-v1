@@ -14,7 +14,6 @@ class Kernel extends ConsoleKernel
      */
     protected $commands = [
         \App\Console\Commands\LowBalanceCheck::class,
-        \App\Console\Commands\UpdateDelhiveryToken::class,
         \App\Console\Commands\KycPendingCheck::class,
         \App\Console\Commands\CheckPendingRemittances::class,
     ];
@@ -35,9 +34,9 @@ class Kernel extends ConsoleKernel
             ->dailyAt('01:00')
             ->withoutOverlapping();
 
-        // Pending Pickup: every 1 minute (if necessary). If heavy, increase to every 2-3 minutes. 
+        // Ready To Ship: every 15 minutes (each run calls Shadowfax tracking once per order)
         $schedule->command('shipment:update-status "Ready To Ship"')
-            ->everyMinute()
+            ->everyFifteenMinutes()
             ->withoutOverlapping()
             ->runInBackground();
 
@@ -73,11 +72,6 @@ class Kernel extends ConsoleKernel
         // Check pending COD remittances scheduled for today - runs daily at 9:00 AM
         $schedule->command('remittance:check-pending')
             ->dailyAt('09:00')
-            ->withoutOverlapping();
-
-        // Update Delhivery token for ID 5
-        $schedule->command('update:delhivery-token')
-            ->dailyAt('23:00')
             ->withoutOverlapping();
     }
 

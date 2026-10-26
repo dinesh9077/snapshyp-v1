@@ -38,6 +38,8 @@ return [
     "shopify_api_secret" => env('SHOPIFY_API_SECRET'),
     "shopify_api_scopes" => env('SHOPIFY_API_SCOPES', 'read_orders,write_orders,read_fulfillments,write_fulfillments,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders,read_locations,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,write_third_party_fulfillment_orders,read_products'),
     "shopify_api_version" => env('SHOPIFY_API_VERSION', '2025-10'),
+    // Public Shopify App Store listing (Integrations > Shopify > Connect Store)
+    "shopify_app_store_url" => env('SHOPIFY_APP_STORE_URL', 'https://apps.shopify.com/snapshyp'),
 
     // Shared secret for courier status webhooks (?token=... in the URL registered with each courier)
     "courier_webhook_secret" => env('COURIER_WEBHOOK_SECRET'),

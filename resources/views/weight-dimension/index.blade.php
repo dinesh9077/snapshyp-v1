@@ -1,6 +1,11 @@
 @extends('layouts.backend.app')
 @section('title', 'Weight Dimension')
 @section('content')
+    @php
+        // Same page for the admin (any seller / global) and for a seller (own slabs only)
+        $isSellerPage = $isSellerPage ?? false;
+        $wdRoute = fn ($name, ...$params) => route(($isSellerPage ? 'seller.weight-dimension.' : 'weight-dimension.') . $name, ...$params);
+    @endphp
     <div class="content-page">
         <div class="content">
             <!-- Start Content-->
@@ -8,13 +13,45 @@
                 <div class="main-order-page-1">
                     <div class="main-order-001">
                         <div class="main-create-order">
-                            <div class="main-disolay-felx" style="margin-top: 0 !important;">
-                                <div class="main-btn0main-1">
+                            <div class="main-disolay-felx align-items-end" style="margin-top: 0 !important; gap: 12px; flex-wrap: wrap;">
+                                {{-- Global slabs apply to every seller; a seller's own slabs win over them --}}
+                                <div style="min-width: 240px;" class="{{ $isSellerPage ? 'd-none' : '' }}">
+                                    <label for="filter_seller" class="mb-1">Slabs for</label>
+                                    <select class="form-control" id="filter_seller">
+                                        <option value="">Global (all sellers)</option>
+                                        @foreach ($sellers as $seller)
+                                            <option value="{{ $seller->id }}" data-default-weight="{{ $seller->default_package_weight + 0 ?: '' }}">
+                                                {{ $seller->company_name ?: $seller->name }} (#{{ $seller->id }})
+                                            </option>
+                                        @endforeach
+                                    </select>
+                                </div>
+                                <div id="sellerDefaultWeightBox" class="{{ $isSellerPage ? '' : 'd-none' }}" style="min-width: 260px;">
+                                    <label for="default_package_weight" class="mb-1"
+                                        title="Used when an order (e.g. from Shopify) arrives with no weight; its dimensions come from the slabs below">
+                                        Default weight for orders without weight (kg)
+                                    </label>
+                                    <div class="d-flex" style="gap: 8px;">
+                                        <input type="number" step="0.001" min="0" class="form-control" id="default_package_weight"
+                                            placeholder="Not set" value="{{ $isSellerPage && ($defaultWeight ?? 0) > 0 ? $defaultWeight + 0 : '' }}">
+                                        <button type="button" class="btn-main-1" id="saveDefaultWeight">Save</button>
+                                    </div>
+                                </div>
+                                <div class="main-btn0main-1 ml-auto">
                                     <button class="btn-main-1" id="createNewWeightDimension">
                                         <span class="mdi mdi-plus"></span> Add Weight Dimension
                                     </button>
                                 </div>
                             </div>
+                            <p class="text-muted small mt-2 mb-0" id="slabScopeNote">
+                                @if ($isSellerPage)
+                                    Your own package sizes per weight slab, used for your orders (Shopify import, bulk ship,
+                                    order form). Once you add any slab, only your slabs are used: a weight above your largest
+                                    slab gets no dimensions. With no slabs of your own, the platform's standard sizes apply.
+                                @else
+                                    Global slabs are used only for sellers who have no slabs of their own.
+                                @endif
+                            </p>
 
                             <div class="main-data-teble-1 table-responsive">
                                 <table id="weightDimensionTable" class="" style="width:100%">
@@ -126,10 +163,11 @@
                     'processing': 'Loading...'
                 },
                 ajax: {
-                    url: "{{ route('weight-dimension.ajax') }}",
+                    url: "{{ $wdRoute('ajax') }}",
                     type: "POST",
                     data: function(d) {
                         d._token = "{{ csrf_token() }}";
+                        d.user_id = $('#filter_seller').val();
                     }
                 },
                 columns: [{
@@ -166,17 +204,50 @@
                 ]
             });
 
+            function selectedSellerName() {
+                return $('#filter_seller').val() ? $.trim($('#filter_seller option:selected').text()) : '';
+            }
+
+            $('#filter_seller').on('change', function() {
+                const sellerId = $(this).val();
+                $('#sellerDefaultWeightBox').toggleClass('d-none', !sellerId);
+                $('#default_package_weight').val($('#filter_seller option:selected').data('default-weight') || '');
+                $('#slabScopeNote').text(sellerId
+                    ? 'Slabs only for ' + selectedSellerName() + '. If this seller has any slab, only these are used (no match = no dimensions); with none, the global slabs apply.'
+                    : 'Global slabs are used only for sellers who have no slabs of their own.');
+                table.draw();
+            });
+
+            $('#saveDefaultWeight').click(function() {
+                const $btn = $(this).prop('disabled', true);
+                $.post("{{ $wdRoute('default-weight') }}", {
+                    user_id: $('#filter_seller').val(),
+                    default_package_weight: $('#default_package_weight').val(),
+                }).done(function(res) {
+                    toastrMsg(res.status, res.msg);
+                    if (res.status === 'success') {
+                        $('#filter_seller option:selected').data('default-weight', $('#default_package_weight').val());
+                    }
+                }).fail(function() {
+                    toastrMsg('error', 'Something went wrong!');
+                }).always(function() {
+                    $btn.prop('disabled', false);
+                });
+            });
+
             $('#createNewWeightDimension').click(function() {
                 $('#saveBtn').val("create-weight-dimension");
                 $('#weight_dimension_id').val('');
                 $('#weightDimensionForm').trigger("reset");
-                $('#modelHeading').html("Create New Weight Dimension");
+                $('#modelHeading').html(@json($isSellerPage) ? "New Weight Dimension" : (selectedSellerName()
+                    ? "New Weight Dimension for " + selectedSellerName()
+                    : "Create New Global Weight Dimension"));
                 $('#ajaxModel').modal('show');
             });
 
             $('body').on('click', '.editWeightDimension', function() {
                 var id = $(this).data('id');
-                $.get("{{ route('weight-dimension.index') }}" + '/' + id + '/edit', function(data) {
+                $.get("{{ $wdRoute('index') }}" + '/' + id + '/edit', function(data) {
                     $('#modelHeading').html("Edit Weight Dimension");
                     $('#saveBtn').val("edit-weight-dimension");
                     $('#ajaxModel').modal('show');
@@ -194,8 +265,8 @@
                 $(this).html('Sending..');
 
                 $.ajax({
-                    data: $('#weightDimensionForm').serialize(),
-                    url: "{{ route('weight-dimension.store') }}",
+                    data: $('#weightDimensionForm').serialize() + '&user_id=' + encodeURIComponent($('#filter_seller').val()),
+                    url: "{{ $wdRoute('store') }}",
                     type: "POST",
                     dataType: 'json',
                     success: function(data) {
@@ -223,7 +294,7 @@
                 if (confirm("Are You sure want to delete !")) {
                     $.ajax({
                         type: "DELETE",
-                        url: "{{ route('weight-dimension.index') }}" + '/' + id,
+                        url: "{{ $wdRoute('index') }}" + '/' + id,
                         success: function(data) {
                             toastrMsg('success', data.msg);
                             table.draw();

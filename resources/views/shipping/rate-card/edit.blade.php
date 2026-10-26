@@ -354,7 +354,8 @@ input:checked+.slider:before {
                                 $detail = $rateCard->rateCardDetails
                                     ->where('shipping_company_id', $shippingCompanyId)
                                     ->first();
-                                return $detail ? $detail->status : 0;
+                                // A courier with no saved rates yet (e.g. a newly added account) starts Active, like on the Add page
+                                return $detail ? $detail->status : 1;
                             }
                         }
 
@@ -430,7 +431,10 @@ input:checked+.slider:before {
 
                                 <div class="mb-4">
                                     <div class="d-flex justify-content-between align-items-center">
-                                        <h6 class="fw-bold text-primary mb-0" style="font-size: 21px; letter-spacing: 1px;">{{ $zoneSettings->first()->shippingCompany->name }}</h6>
+                                        <div class="d-flex align-items-center">
+                                            <h6 class="fw-bold text-primary mb-0" style="font-size: 21px; letter-spacing: 1px;">{{ $zoneSettings->first()->shippingCompany->name }}</h6>
+                                            @include('shipping.rate-card.partials.copy-rates')
+                                        </div>
                                         <div>
                                             <select class="form-select select2" name="shipping[{{ $index }}][status]">
                                                 <option value="1"
@@ -702,6 +706,7 @@ input:checked+.slider:before {
 @endsection
 
 @push('js')
+@include('shipping.rate-card.partials.copy-rates-js')
 <script>
     const otherChargeMastersByCompany = @json(($otherChargeMasters ?? collect())->map(function ($rows) {
         return collect($rows)->values()->all();

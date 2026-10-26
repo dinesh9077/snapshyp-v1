@@ -3,12 +3,9 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\ShippingCompany;
 use App\Models\NdrDetail;
 use App\Models\NdrRequest;
 use App\Models\Order;
-use App\Services\ShipMozo;
-use App\Services\DelhiveryNdrService;
 use App\Traits\ApiResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{DB, Auth, Log, Cache, Validator, Http};
@@ -32,9 +29,8 @@ class NdrController extends Controller
         $role   = $user->role;
         $userId = $user->id;
 
-        // Keep local NDR info updated from APIs
-        $this->syncDelhiveryPendingOrdersToNdr();
-        $this->syncShipmozoApiNdrToLocal();
+        // Keep local NDR info updated with pending orders of the supported courier (Shadowfax, ID=1)
+        $this->syncPendingOrdersToNdr();
 
         $query = NdrDetail::with(['orderAwb', 'orderAwb.user', 'orderAwb.customer'])
             ->whereHas('orderAwb')
@@ -43,8 +39,8 @@ class NdrController extends Controller
 
         // Filter by shipping company (matching web logic)
         if ($status === 'all') {
-            $query->whereIn('shipping_id', [1, 2]);
-        } elseif (in_array((int) $status, [1, 2], true)) {
+            $query->whereIn('shipping_id', \App\Models\ShippingCompany::where('provider', 'shadowfax')->pluck('id'));
+        } elseif (in_array((int) $status, [1], true)) {
             $query->where('shipping_id', (int) $status);
         }
 
@@ -94,7 +90,7 @@ class NdrController extends Controller
             $orderStatus = strtolower($order->status_courier ?? 'new');
             $shippingId = (int) $order->shipping_company_id;
 
-            if ($shippingId == 1) { // Delhivery
+            if ($shippingId == 1) { // Shadowfax
                 $nsl = null;
                 if (is_array($item->response) && !empty($item->response['NSLCode'])) {
                     $nsl = $item->response['NSLCode'];
@@ -118,10 +114,6 @@ class NdrController extends Controller
                 // Don't allow action if a request was already raised AFTER the latest NDR event date
                 if ($canTakeAction && $ndrRequest && $ndrRequest->created_at->toDateString() > $item->ndr_date) {
                      $canTakeAction = false;
-                }
-            } elseif ($shippingId == 2) { // ShipMozo
-                if (in_array($orderStatus, ["undelivered", "ndr", "out for delivery", "manifested"])) {
-                    $canTakeAction = true;
                 }
             }
 
@@ -190,20 +182,10 @@ class NdrController extends Controller
             $remarks     = $request->input('remarks');
             $date        = $request->input('reattemptdate');
 
-            if ($shipping_id == 1) { // Delhivery
-                $delhivery = ShippingCompany::find($shipping_id);
-                $service = app(DelhiveryNdrService::class);
+            if (\App\Models\ShippingCompany::isShadowfaxId($shipping_id)) { // Shadowfax
+                // No courier NDR API is integrated for Shadowfax; the request is recorded locally only.
                 $mappedAction = 'RE-ATTEMPT';
-                
-                $resp = $service->sendNdrAction($awb_number, $mappedAction, $delhivery);
-                
-                $ndrStatusResp = $service->getNdrStatus($resp['upl_id'] ?? null, $delhivery);
-                $statusResult = $resp['success'] ? 'upl_sent' : 'upl_failed';
-
-                if ($ndrStatusResp['success']) {
-                    $remarks = $ndrStatusResp['response']['remark'] ?? $remarks;
-                    $statusResult = $ndrStatusResp['response']['status'] ?? $statusResult;
-                }
+                $statusResult = 'upl_failed';
 
                 NdrRequest::create([
                     'order_id' => $order_id,
@@ -226,58 +208,18 @@ class NdrController extends Controller
                         'order_id' => $order_id,
                         'ndr_date' => $date ?: now(),
                         'total_attempts' => $total_attempts,
-                        'upl_id' => $resp['upl_id'] ?? null,
+                        'upl_id' => null,
                         'status' => $statusResult,
                         'action' => $mappedAction,
-                        'response' => $resp['response'] ?? $resp,
                     ]
                 );
 
                 DB::commit();
-                return $this->successResponse(null, 'Delhivery NDR request sent.');
+                return $this->successResponse(null, 'NDR request raised successfully.');
 
-            } elseif ($shipping_id == 2) { // ShipMozo
-                $shipMozo = app(ShipMozo::class);
-                $shippingCompany = ShippingCompany::find($shipping_id);
-                $mappedAction = (strtolower($action) == 're-attempt') ? 'RE-ATTEMPT' : $action;
-
-                $resp = $shipMozo->ndrAction($awb_number, $mappedAction, $remarks, $shippingCompany, $date);
-
-                if (!($resp['success'] ?? false)) {
-                    DB::rollBack();
-                    return $this->errorResponse($resp['response']['message'] ?? ($resp['response']['error'] ?? 'An error occurred during ShipMozo NDR action.'));
-                }
-
-                NdrRequest::create([
-                    'order_id' => $order_id,
-                    'action' => $action,
-                    'shipping_company_id' => $shipping_id,
-                    'reattemptdate' => $date,
-                    'remarks' => $remarks,
-                    'awb_number' => $awb_number,
-                ]);
-
-                Helper::orderActivity($order_id, "NDR action taken: " . strtoupper($action));
-
-                $total_attempts = NdrRequest::where('awb_number', $awb_number)->count();
-                NdrDetail::updateOrCreate(
-                    ['awb_number' => $awb_number],
-                    [
-                        'shipping_id' => $shipping_id,
-                        'order_id' => $order_id,
-                        'ndr_date' => now(),
-                        'total_attempts' => $total_attempts,
-                        'status' => 'action_taken',
-                        'action' => $mappedAction,
-                        'response' => $resp['response'],
-                    ]
-                );
-
-                DB::commit();
-                return $this->successResponse(null, 'NDR Request raised successfully.');
             } else {
                 DB::rollBack();
-                return $this->errorResponse('NDR action is only supported for Delhivery and ShipMozo.');
+                return $this->errorResponse('NDR action is only supported for Shadowfax.');
             }
         } catch (\Exception $e) {
             DB::rollBack();
@@ -288,14 +230,14 @@ class NdrController extends Controller
     /**
      * Synchronization Helpers
      */
-    private function syncDelhiveryPendingOrdersToNdr()
+    private function syncPendingOrdersToNdr()
     {
         try {
-            if (Cache::has('delhivery_pending_ndr_sync_lock')) return;
-            Cache::put('delhivery_pending_ndr_sync_lock', 1, now()->addSeconds(60));
+            if (Cache::has('pending_ndr_sync_lock')) return;
+            Cache::put('pending_ndr_sync_lock', 1, now()->addSeconds(60));
 
             $orders = Order::select('id', 'awb_number', 'shipping_company_id', 'status_courier', 'updated_at')
-                ->where('shipping_company_id', 1)
+                ->whereIn('shipping_company_id', \App\Models\ShippingCompany::where('provider', 'shadowfax')->pluck('id'))
                 ->whereNotNull('awb_number')->where('awb_number', '!=', '')
                 ->whereRaw('LOWER(status_courier) = ?', ['pending'])
                 ->limit(500)->get();
@@ -309,62 +251,6 @@ class NdrController extends Controller
                     'response' => ['source' => 'order_status', 'status_courier' => $order->status_courier],
                 ]);
             }
-        } catch (\Throwable $e) { Log::error('Delhivery pending NDR sync failed: ' . $e->getMessage()); }
-    }
-
-    private function syncShipmozoApiNdrToLocal()
-    {
-        try {
-            if (Cache::has('shipmozo_ndr_sync_lock')) return;
-            Cache::put('shipmozo_ndr_sync_lock', 1, now()->addSeconds(120));
-
-            $shippingCompany = ShippingCompany::where('id', 2)->where('status', 1)->first();
-            if (!$shippingCompany) return;
-
-            $shipMozo = app(ShipMozo::class);
-            $page = 1; $maxPages = 5;
-            while ($page <= $maxPages) {
-                $resp = $shipMozo->getNdrAll($shippingCompany, ['per_page' => 100, 'page' => $page]);
-                if (!($resp['success'] ?? false)) break;
-                $rows = $resp['response']['data'] ?? [];
-                if (empty($rows)) break;
-
-                foreach ($rows as $item) {
-                    $awb = trim((string)($item['awb_number'] ?? ''));
-                    if ($awb === '') continue;
-                    $status = str_replace('_', ' ', strtolower((string)($item['webparex_status'] ?? $item['order_status'] ?? '')));
-                    if (!$this->isShipmozoNdrStatus($status)) continue;
-
-                    $order = Order::select('id', 'awb_number', 'status_courier')
-                        ->where('shipping_company_id', 2)
-                        ->where(function ($q) use ($awb, $item) {
-                            $q->where('awb_number', $awb);
-                            if (!empty($item['ref_order_id'])) $q->orWhere('order_prefix', trim($item['ref_order_id']));
-                        })->first();
-
-                    if (!$order) continue;
-                    
-                    if (strtolower((string)$order->status_courier) !== $status) {
-                        Order::where('id', $order->id)->update(['status_courier' => ucwords($status)]);
-                    }
-
-                    NdrDetail::updateOrCreate(['awb_number' => $awb], [
-                        'shipping_id' => 2, 'order_id' => $order->id,
-                        'ndr_date' => now()->toDateString(),
-                        'remarks' => (string)($item['courier_status'] ?? $item['webparex_status'] ?? 'NDR'),
-                        'total_attempts' => NdrRequest::where('awb_number', $awb)->count(),
-                        'status' => $status ?: 'ndr', 'action' => 'RE-ATTEMPT', 'response' => $item,
-                    ]);
-                }
-                if (empty($resp['response']['next_page_url'])) break;
-                $page++;
-            }
-        } catch (\Throwable $e) { Log::error('ShipMozo NDR sync failed: ' . $e->getMessage()); }
-    }
-
-    private function isShipmozoNdrStatus(string $status): bool
-    {
-        $status = strtolower(trim($status));
-        return in_array($status, ['undelivered', 'ndr', 'out for delivery', 'out_for_delivery', 'manifested', 'pending', 'scheduled', 'in transit', 'in_transit'], true);
+        } catch (\Throwable $e) { Log::error('Pending NDR sync failed: ' . $e->getMessage()); }
     }
 }

@@ -35,27 +35,6 @@ Route::get('/', function () {
 Route::post('/woocommerce/order/create', [App\Http\Controllers\WoocommerceController::class, 'orderCreated']);
 Route::post('/woocommerce/order/cancelled', [App\Http\Controllers\WoocommerceController::class, 'orderCancelled']);
 
-//Status Update Webhook
-Route::match (
-['post'],
-	'/delhivery/webhook',
-[WebhookController::class , 'delhiveryWebhook']
-)->middleware('courier.webhook');
-
-// UrbaneBolt Status Update Webhook
-Route::match (
-['post'],
-	'/urbanebolt/webhook',
-[WebhookController::class , 'urbaneboltWebhook']
-)->middleware('courier.webhook');
-
-// Shipmozo Status Update Webhook
-Route::match (
-['post'],
-	'/shipmozo/webhook',
-[WebhookController::class , 'shipmozoWebhook']
-)->middleware('courier.webhook');
-
 // Shadowfax Status Update Webhook
 Route::match (
 ['post'],
@@ -154,6 +133,18 @@ Route::post('/shopify/bulk-shipment/now', [ShopifyController::class , 'orderShop
 	->name('shopify.bulk-shipment.now')
 	->middleware(['shopifyCsp', 'shopify.embedded.auth']);
 
+Route::get('/shopify/bulk-shipment/quote', [ShopifyController::class , 'shopifyBulkShipQuote'])
+	->name('shopify.bulk-shipment.quote')
+	->middleware(['shopifyCsp', 'shopify.embedded.auth']);
+
+Route::get('/shopify/bulk-shipment/status/{batch}', [ShopifyController::class , 'shopifyBulkShipStatus'])
+	->name('shopify.bulk-shipment.status')
+	->middleware(['shopifyCsp', 'shopify.embedded.auth']);
+
+Route::post('/shopify/bulk-shipment/retry/{batch}', [ShopifyController::class , 'shopifyBulkShipRetry'])
+	->name('shopify.bulk-shipment.retry')
+	->middleware(['shopifyCsp', 'shopify.embedded.auth']);
+
 Route::post('/api/update-sync-setting', [ShopifyController::class , 'updateSync'])
 	->name('shopify.sync.update')
 	->middleware(['shopifyCsp', 'shopify.embedded.auth']);
@@ -216,6 +207,16 @@ Route::group(['prefix' => 'setting'], function () {
 	// New Label Settings Module
 	Route::get('/label-settings', [App\Http\Controllers\SettingController::class , 'labelSettings'])->name('label.settings');
 	Route::post('/label-settings/update', [App\Http\Controllers\SettingController::class , 'updateLabelSettings'])->name('label.settings.update');
+
+	// Seller's own weight slabs + default weight (sellers only; admins use /weight-dimension)
+	Route::group(['prefix' => 'weight-dimension', 'middleware' => 'auth'], function () {
+		Route::get('/', [App\Http\Controllers\WeightDimensionController::class , 'sellerIndex'])->name('seller.weight-dimension.index');
+		Route::post('/ajax', [App\Http\Controllers\WeightDimensionController::class , 'getWeightDimensionAjax'])->name('seller.weight-dimension.ajax');
+		Route::post('/store', [App\Http\Controllers\WeightDimensionController::class , 'store'])->name('seller.weight-dimension.store');
+		Route::post('/default-weight', [App\Http\Controllers\WeightDimensionController::class , 'saveDefaultWeight'])->name('seller.weight-dimension.default-weight');
+		Route::get('/{id}/edit', [App\Http\Controllers\WeightDimensionController::class , 'edit'])->name('seller.weight-dimension.edit');
+		Route::delete('/{id}', [App\Http\Controllers\WeightDimensionController::class , 'destroy'])->name('seller.weight-dimension.destroy');
+	});
 });
 
 // User COD Remittance - List all users
@@ -303,7 +304,6 @@ Route::group(['prefix' => 'pickup-request'], function () {
 	Route::get('/', [App\Http\Controllers\WarehouseController::class , 'pickupRequestList'])->name('pickup.request.index')->middleware('permission:pickup_request.view');
 	Route::post('/ajax', [App\Http\Controllers\WarehouseController::class , 'pickupRequestAjax'])->name('pickup.request.ajax');
 	Route::post('/create', [App\Http\Controllers\WarehouseController::class , 'createPickupRequest'])->name('pickup.request.create');
-//Route::get('/cancel/{id}', [App\Http\Controllers\WarehouseController::class, 'cancelPickupRequest'])->name('pickup.request.cancel');
 });
 
 Route::get('courier-commission', [App\Http\Controllers\CourierCommissionController::class , 'index'])->name('courier.commission')->middleware('permission:general_setting.view');
@@ -547,7 +547,6 @@ Route::group(['prefix' => 'order'], function () {
 	Route::post('/manual-status/{id}', [App\Http\Controllers\OrderController::class , 'orderManualStatusUpdate'])->name('order.manual-status');
 
 	Route::get('/shipping-lable/{orderId}', [App\Http\Controllers\OrderController::class , 'orderShippingLableDownload'])->name('order.shipping-download');
-	Route::get('/waybill-copy/{orderId}', [App\Http\Controllers\OrderController::class , 'orderWayBillCopy']);
 
 	Route::get('/download-label/{id}', [App\Http\Controllers\OrderController::class , 'orderLableDownload'])->name('order.downloadLabel');
 	Route::get('/download/all-lable', [App\Http\Controllers\OrderController::class , 'alllabeldownload'])->name('order.download-all-lable');
@@ -558,6 +557,8 @@ Route::group(['prefix' => 'order'], function () {
 	Route::post('/package-dimension/bulk-update', [App\Http\Controllers\OrderController::class , 'orderPackageDimensionBulkUpdate'])->name('order.package-dimension.bulk-update');
 
 	Route::post('/bulk-shipment/now', [App\Http\Controllers\OrderController::class , 'orderBulkShipNow'])->name('order.bulk-shipment.now');
+	Route::get('/bulk-shipment/status/{batch}', [App\Http\Controllers\OrderController::class , 'orderBulkShipStatus'])->name('order.bulk-shipment.status');
+	Route::post('/bulk-shipment/retry/{batch}', [App\Http\Controllers\OrderController::class , 'orderBulkShipRetry'])->name('order.bulk-shipment.retry');
 	Route::post('/bulk-shipment-cancel', [App\Http\Controllers\OrderController::class , 'orderBulkCancel'])->name('order.bulk-shipment-cancel');
 	Route::post('/bulk-sync-channel', [App\Http\Controllers\OrderController::class , 'orderBulkSyncChannel'])->name('order.bulk-sync-channel');
 
@@ -729,10 +730,13 @@ Route::group(['prefix' => 'weight-dimension', 'middleware' => 'permission:genera
 	Route::get('/', [App\Http\Controllers\WeightDimensionController::class , 'index'])->name('weight-dimension.index');
 	Route::post('/ajax', [App\Http\Controllers\WeightDimensionController::class , 'getWeightDimensionAjax'])->name('weight-dimension.ajax');
 	Route::post('/store', [App\Http\Controllers\WeightDimensionController::class , 'store'])->name('weight-dimension.store');
-	Route::get('/get-by-slab', [App\Http\Controllers\WeightDimensionController::class , 'getBySlab'])->name('weight-dimension.get-by-slab');
+	Route::post('/default-weight', [App\Http\Controllers\WeightDimensionController::class , 'saveDefaultWeight'])->name('weight-dimension.default-weight');
 	Route::get('/{id}/edit', [App\Http\Controllers\WeightDimensionController::class , 'edit'])->name('weight-dimension.edit');
 	Route::delete('/{id}', [App\Http\Controllers\WeightDimensionController::class , 'destroy'])->name('weight-dimension.destroy');
 });
+// Order form auto-fill: sellers need it too (it answers from their own slabs, then the global ones)
+Route::get('weight-dimension/get-by-slab', [App\Http\Controllers\WeightDimensionController::class , 'getBySlab'])
+	->middleware('auth')->name('weight-dimension.get-by-slab');
 
 Route::get('card/download-sample', [App\Http\Controllers\ShippingController::class , 'downloadSampleRateCardTemplate'])->name('card.download-sample-template');
 Route::get('card/download-sample/{id}', [App\Http\Controllers\ShippingController::class , 'downloadSampleRateCard'])->name('card.download-sample');

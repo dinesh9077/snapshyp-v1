@@ -18,6 +18,7 @@ class User extends Authenticatable
      * @var array
      */
     protected $fillable = [
+        'assigned_shipping_company_id',
         'name',
         'email',
         'email_verified_at',

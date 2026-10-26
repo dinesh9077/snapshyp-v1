@@ -14,6 +14,8 @@ class ShippingCompany extends Model
     protected $fillable = [
         'user_id',
         'name',
+        'provider',
+        'is_default',
         'api_key',
         'secret_key',
         'email',
@@ -33,8 +35,65 @@ class ShippingCompany extends Model
 
     protected $casts = [
         'expired_at' => 'datetime',
+        'is_default' => 'boolean',
     ];
-	
+
+    public const PROVIDER_SHADOWFAX = 'shadowfax';
+
+    // Integrated couriers and the credential fields each one needs (field => form label)
+    public const PROVIDERS = [
+        self::PROVIDER_SHADOWFAX => [
+            'label' => 'Shadowfax',
+            'fields' => ['api_key' => 'Api Key/Token', 'url' => 'Url'],
+            'default_url' => 'https://dale.shadowfax.in/api',
+        ],
+    ];
+
+    // Every credential field any provider uses, for building the account form
+    public static function credentialFields(): array
+    {
+        $fields = [];
+        foreach (self::PROVIDERS as $provider) {
+            $fields += $provider['fields'];
+        }
+        return $fields;
+    }
+
+    public function providerLabel(): string
+    {
+        return self::PROVIDERS[$this->provider]['label'] ?? 'Other';
+    }
+
+    // Every account of the Shadowfax integration (not just id 1) uses ShadowfaxService
+    public function isShadowfax(): bool
+    {
+        return $this->provider === self::PROVIDER_SHADOWFAX;
+    }
+
+    public static function isShadowfaxId($id): bool
+    {
+        return $id !== null && static::whereKey($id)->where('provider', self::PROVIDER_SHADOWFAX)->exists();
+    }
+
+    /**
+     * Courier accounts a seller may quote and ship with: per provider, the account assigned
+     * to the seller if it is active, otherwise that provider's default account.
+     */
+    public static function availableFor($user)
+    {
+        $active = static::where('status', 1)->where('provider', '!=', 'other')->orderBy('id')->get();
+
+        return $active->groupBy('provider')->map(function ($accounts) use ($user) {
+            $assigned = $user ? $accounts->firstWhere('id', (int) $user->assigned_shipping_company_id) : null;
+            return $assigned ?? $accounts->firstWhere('is_default', true) ?? $accounts->first();
+        })->filter()->values();
+    }
+
+    public static function isAvailableFor($user, $shippingCompanyId): bool
+    {
+        return static::availableFor($user)->contains('id', (int) $shippingCompanyId);
+    }
+
     public function hasExpired()
     {
         if (!$this->expired_at) {
@@ -45,37 +104,6 @@ class ShippingCompany extends Model
 
     public function scopeVisibleInRateCards($query)
     {
-        return $query
-            ->where(function ($query) {
-                $query->whereNull('name')
-                    ->orWhereRaw('LOWER(name) NOT LIKE ?', ['%routx%']);
-            })
-            ->where(function ($query) {
-                $query->whereNull('url')
-                    ->orWhereRaw('LOWER(url) NOT LIKE ?', ['%routxmitra%']);
-            });
-    }
-
-    public function scopeWithoutRoutx($query)
-    {
-        return $query
-            ->where('id', '!=', 1)
-            ->where(function ($query) {
-                $query->whereNull('name')
-                    ->orWhereRaw('LOWER(name) NOT LIKE ?', ['%routx%']);
-            })
-            ->where(function ($query) {
-                $query->whereNull('url')
-                    ->orWhereRaw('LOWER(url) NOT LIKE ?', ['%routxmitra%']);
-            });
-    }
-
-    public function scopeVisibleForUser($query, $user)
-    {
-        if ($user && method_exists($user, 'canAccessRoutx') && !$user->canAccessRoutx()) {
-            return $query->withoutRoutx();
-        }
-
         return $query;
     }
 

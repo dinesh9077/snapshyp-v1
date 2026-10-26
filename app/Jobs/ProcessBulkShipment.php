@@ -8,6 +8,7 @@ use App\Models\User;
 use App\Models\Shop;
 use App\Models\ShippingCompany;
 use App\Models\WeightDimension;
+use App\Services\BulkShipBatch;
 use App\Services\MasterService;
 use App\Services\FulfillShopifyOrder;
 use App\Services\ShipmentProcessor;
@@ -28,17 +29,21 @@ class ProcessBulkShipment implements ShouldQueue
     protected array $orderIds;
     protected array $requestData;
     protected $user;
+    // Live progress for the order page (BulkShipBatch); null = not tracked. The default keeps jobs
+    // queued before this property existed working after a deploy.
+    protected ?string $batchId = null;
 
     // Booking shipments is not safe to repeat automatically, and a batch can take long
     // (several courier calls per order). Keep queue retry_after above this timeout.
     public $tries = 1;
     public $timeout = 3600;
 
-    public function __construct(array $orderIds, array $requestData = [], $user = null)
+    public function __construct(array $orderIds, array $requestData = [], $user = null, ?string $batchId = null)
     {
         $this->orderIds = $orderIds;
         $this->requestData = $requestData;
         $this->user = $user;
+        $this->batchId = $batchId;
     }
 
     /**
@@ -64,10 +69,12 @@ class ProcessBulkShipment implements ShouldQueue
         if (!$shippingCompany) {
             Order::whereIn('id', $this->orderIds)->where('queue', 1)
                 ->update(['queue' => 0, 'shipment_failure_reason' => 'Selected courier is not available']);
+            BulkShipBatch::finish($this->batchId, 'Selected courier is not available');
             return;
         }
         foreach ($this->orderIds as $orderId) {
             $order = Order::with('orderItems')->find($orderId);
+            BulkShipBatch::processing($this->batchId, (int) $orderId);
 
             try {
 
@@ -76,11 +83,11 @@ class ProcessBulkShipment implements ShouldQueue
                     continue;
                 }
 
-                if ((int) $order->weight_order === 2 && !in_array((int) $shippingCompany->id, [1, 3, 4, 5])) {
+                if ((int) $order->weight_order === 2 && !$shippingCompany->isShadowfax()) {
                     $summary['skipped']++;
                     $order->update([
                         'queue' => 0,
-                        'shipment_failure_reason' => 'B2B shipment is supported only with Delhivery/Routx.'
+                        'shipment_failure_reason' => 'B2B shipment is supported only with Shadowfax.'
                     ]);
                     continue;
                 }
@@ -122,7 +129,8 @@ class ProcessBulkShipment implements ShouldQueue
                     )
                 ) {
 
-                    $defDimension = WeightDimension::where('slab', $order->weight)->first();
+                    // The order owner's own slab first, then the global one
+                    $defDimension = WeightDimension::forWeight((int) $order->user_id, $order->weight);
                     if ($defDimension) {
                         $order->length = ($order->length > 0) ? $order->length : $defDimension->length;
                         $order->width = ($order->width > 0) ? $order->width : $defDimension->width;
@@ -164,8 +172,8 @@ class ProcessBulkShipment implements ShouldQueue
                 // Calculate charges via RateCardService
                 $rateResults = $rateCardService->getRate($this->user, $shippingCompany, $requestData, $isOrder = 1);
 
-                if ($shippingCompany->id == 1 && !empty($this->requestData['courier_id'])) {
-                    // For Routx/Aggregators, pick the selected courier
+                if ($shippingCompany->isShadowfax() && !empty($this->requestData['courier_id'])) {
+                    // Pick the selected courier
                     $targetCourierId = (string) $this->requestData['courier_id'];
                     $filteredCouriers = array_filter($rateResults ?? [], function($r) use ($targetCourierId) {
                         return (string)($r['courier_id'] ?? '') === $targetCourierId;
@@ -184,7 +192,7 @@ class ProcessBulkShipment implements ShouldQueue
                 $requestParam = [
                     'order_id' => $charges['order_id'],
                     'shipping_company_id' => $charges['shipping_company_id'],
-                    'courier_id' => $charges['courier_id'],
+                    'courier_id' => $charges['courier_id'] ?? null, // rate results don't always carry one (Shadowfax doesn't)
                     'freight_charges' => $charges['freight_charges'] ?? null,
                     'cod_charges' => $charges['cod_charges'] ?? 0,
                     'tax' => $charges['tax'] ?? 0,
@@ -246,8 +254,13 @@ class ProcessBulkShipment implements ShouldQueue
                     $order->update(['queue' => 0, 'shipment_failure_reason' => $e->getMessage()]);
                 }
                 continue;
+            } finally {
+                // Every path above (including each `continue`) ends here: report the order's outcome
+                $this->recordProgress((int) $orderId, $order);
             }
         }
+
+        BulkShipBatch::finish($this->batchId);
 
         // Notification for the user (or system)
         if ($this->user) {
@@ -272,10 +285,33 @@ class ProcessBulkShipment implements ShouldQueue
         }
     }
 
+    private function recordProgress(int $orderId, ?Order $order): void
+    {
+        if (!$this->batchId) {
+            return;
+        }
+        try {
+            if (!$order) {
+                BulkShipBatch::result($this->batchId, $orderId, 'skipped', null, 'Order not found.');
+                return;
+            }
+            $order->refresh();
+            if ((int) $order->queue === 2 && !empty($order->awb_number)) {
+                BulkShipBatch::result($this->batchId, $orderId, 'success', $order->awb_number);
+            } else {
+                BulkShipBatch::result($this->batchId, $orderId, 'failed', null, $order->shipment_failure_reason ?: 'Shipment failed.');
+            }
+        } catch (\Throwable $e) {
+            // Progress is informational; never let it break the shipment run
+            Log::warning('Bulk ship progress update failed', ['order_id' => $orderId, 'error' => $e->getMessage()]);
+        }
+    }
+
     // Job died (timeout, crash): don't leave orders stuck in "Processing"
     public function failed(\Throwable $e): void
     {
         Order::whereIn('id', $this->orderIds)->where('queue', 1)
             ->update(['queue' => 0, 'shipment_failure_reason' => 'Bulk shipment stopped: ' . substr($e->getMessage(), 0, 150)]);
+        BulkShipBatch::finish($this->batchId, 'Bulk shipment stopped: ' . substr($e->getMessage(), 0, 150));
     }
 }

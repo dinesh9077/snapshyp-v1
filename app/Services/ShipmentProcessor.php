@@ -12,7 +12,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use App\Helpers\Helper;
 use App\Support\OrderType;
-use App\Services\{DelhiveryB2CService, DelhiveryService, FulfillShopifyOrder, ShipMozo, ShadowfaxService};
+use App\Services\{FulfillShopifyOrder, ShadowfaxService};
 
 class ShipmentProcessor
 {
@@ -134,8 +134,6 @@ class ShipmentProcessor
 
     public function orderShipNow($requestData)
     {
-        $delhiveryB2CService = app(DelhiveryB2CService::class);
-        $routxService = app(RoutxService::class);
         $shadowfaxService = app(ShadowfaxService::class);
         $shopifyFulfill = app(FulfillShopifyOrder::class);
 
@@ -163,6 +161,22 @@ class ShipmentProcessor
             return $this->shipError($requestData, 'Permission denied.');
         }
 
+        // Queued for bulk shipment: only that bulk job may book it (a manual Ship Now would book it twice)
+        if ((int) $order->queue === 1 && empty($order->awb_number) && (int) ($requestData['is_bulk_shipment'] ?? 0) !== 1) {
+            return $this->shipError($requestData, 'This order is being processed by a bulk shipment. Please wait for it to finish.');
+        }
+
+        // Ship with the order owner's own account of the chosen courier (assigned, else default);
+        // the UI only picks the courier, so an admin bulk ship still uses each seller's account
+        $ownerAccount = ShippingCompany::availableFor($user)->firstWhere('provider', $shippingCompany->provider);
+        if (!$ownerAccount) {
+            return $this->shipError($requestData, 'This courier is not available for this seller.');
+        }
+        if ((int) $ownerAccount->id !== (int) $shippingCompany->id) {
+            $shippingCompany = $ownerAccount;
+            $requestData['shipping_company_id'] = $ownerAccount->id;
+        }
+
         // Business rule (shared with manual create, API and bulk import): the order
         // must be COD or Prepaid before any courier shipment is booked. Checked here at
         // the single gate every courier passes through, so the message surfaces cleanly;
@@ -174,7 +188,7 @@ class ShipmentProcessor
             return response()->json(['status' => 'error', 'msg' => OrderType::INVALID_MESSAGE]);
         }
 
-        $isRestrictedShadowfax = (int) $shippingCompany->id === 1
+        $isRestrictedShadowfax = $shippingCompany->isShadowfax()
             && method_exists($user, 'canAccessShadowfax')
             && !$user->canAccessShadowfax();
         if ($isRestrictedShadowfax) {
@@ -241,7 +255,6 @@ class ShipmentProcessor
             return response()->json(['status' => 'error', 'msg' => 'Order already shipped.']);
         }
 
-        $courierWarehouse = $order->warehouse;
         // Defaults
         $courier_name = null;
         $shipment_id = null;
@@ -253,7 +266,7 @@ class ShipmentProcessor
         $courierLogo = $requestData['shipping_company_logo'] ?? null;
 
         // Shadowfax (ID = 1) - Replaced ROUTX with Shadowfax
-        if ((int) $shippingCompany->id === 1) {
+        if ($shippingCompany->isShadowfax()) {
             Log::info('Shadowfax: Starting shipment processing', [
                 'order_id' => $order->id,
                 'order_prefix' => $order->order_prefix,
@@ -289,179 +302,7 @@ class ShipmentProcessor
             $apiResponse = $createOrderResponse['data'] ?? [];
             $courier_id = $requestData['courier_id'] ?? 1;
             $courier_name = $requestData['courier_name'] ?? 'Shadowfax';
-        }
-
-        elseif ($shippingCompany->id === 3) {
-            Log::info('Delhivery: Starting shipment processing', [
-                'order_id' => $order->id,
-                'order_prefix' => $order->order_prefix,
-                'warehouse_id' => $courierWarehouse->id ?? null,
-                'user_id' => $user->id
-            ]);
-
-            $existStatus = $courierWarehouse->created ?? [];
-
-            if (empty($existStatus['delhivery_status']) || $existStatus['delhivery_status'] == 0) {
-                Log::info('Delhivery: Warehouse not created, attempting to create', [
-                    'warehouse_id' => $courierWarehouse->id,
-                    'warehouse_name' => $courierWarehouse->company_name ?? null
-                ]);
-
-                $data = $delhiveryB2CService->createWarehouse($courierWarehouse, $shippingCompany);
-
-                Log::info('Delhivery: Warehouse creation response', [
-                    'warehouse_id' => $courierWarehouse->id,
-                    'success' => $data['success'] ?? false,
-                    'response' => $data['response'] ?? null
-                ]);
-
-                // Handle success OR "already exists" error
-                if (!empty($data['success']) && !empty($data['response']['success'])) {
-                    $existingCreated = $courierWarehouse->created ?? [];
-                    if (is_string($existingCreated)) {
-                        $existingCreated = json_decode($existingCreated, true) ?? [];
-                    }
-                    $existingCreated['delhivery_status'] = 1;
-                    $courierWarehouse->created = $existingCreated;
-                    $courierWarehouse->shipping_id = $shippingCompany->id;
-                    $courierWarehouse->api_response = $data['response'];
-                    $courierWarehouse->save();
-                    $order->setRelation('warehouse', $courierWarehouse->fresh());
-
-                    Log::info('Delhivery: Warehouse created successfully', [
-                        'warehouse_id' => $courierWarehouse->id
-                    ]);
-                } else {
-                    // Check if error is "already exists"
-                    $errorMsg = $data['response']['error']['list-item'] ?? '';
-                    if (str_contains($errorMsg, 'already exists')) {
-                        // Warehouse already exists, mark as created
-                        $existingCreated = $courierWarehouse->created ?? [];
-                        if (is_string($existingCreated)) {
-                            $existingCreated = json_decode($existingCreated, true) ?? [];
-                        }
-                        $existingCreated['delhivery_status'] = 1;
-                        $courierWarehouse->created = $existingCreated;
-                        $courierWarehouse->shipping_id = $shippingCompany->id;
-                        // Still try to save api_response if it contains data (might happen if creation fails with 'exists' but returns metadata)
-                        if (!empty($data['response']['data'])) {
-                            $courierWarehouse->api_response = $data['response'];
-                        }
-                        $courierWarehouse->save();
-                        $order->setRelation('warehouse', $courierWarehouse->fresh());
-
-                        Log::info('Delhivery: Warehouse already exists, marked as created', [
-                            'warehouse_id' => $courierWarehouse->id
-                        ]);
-                    } else {
-                        Log::warning('Delhivery: Warehouse creation failed', [
-                            'warehouse_id' => $courierWarehouse->id,
-                            'response' => $data['response'] ?? null
-                        ]);
-                    }
-                }
-            }
-
-            Log::info('Delhivery: Sending manifest request', [
-                'order_id' => $order->id,
-                'order_prefix' => $order->order_prefix,
-                'total_charges' => $requestData['total_charges'] ?? null,
-                'applicable_weight' => $requestData['applicable_weight'] ?? null,
-                'payment_mode' => $requestData['payment_mode'] ?? null
-            ]);
-
-            $response = $delhiveryB2CService->manifest($order, $requestData, $shippingCompany);
-
-            Log::info('Delhivery: Manifest response received', [
-                'order_id' => $order->id,
-                'success' => $response['success'] ?? false,
-                'response' => $response
-            ]);
-
-            if (!($response['success'] ?? false)) {
-                $errorMsg = $response['response']['errors'][0]['message'] ?? ($response['response']['error']['message'] ?? 'An error occurred.');
-
-                Log::error('Delhivery: Manifest failed - success flag false', [
-                    'order_id' => $order->id,
-                    'error_message' => $errorMsg,
-                    'full_response' => $response['response'] ?? null
-                ]);
-
-                if ($requestData['is_bulk_shipment'] == 1) {
-                    return ['status' => 'error', 'msg' => $errorMsg];
-                }
-                return response()->json(['status' => 'error', 'msg' => $errorMsg]);
-            }
-
-            if ((isset($response['response']['success']) && !$response['response']['success'])) {
-                $errmsg = $response['response']['rmk'];
-                if (is_array($response['response']['packages']) && count($response['response']['packages']) > 0) {
-                    $errmsg = $response['response']['packages'][0]['remarks'][0] ?? $response['response']['rmk'];
-                }
-
-                if (is_array($errmsg)) {
-                    $errmsg = implode(', ', $errmsg);
-                }
-
-
-                Log::error('Delhivery: Manifest response indicates failure', [
-                    'order_id' => $order->id,
-                    'error_message' => $errmsg,
-                    'rmk' => $response['response']['rmk'] ?? null,
-                    'packages' => $response['response']['packages'] ?? null
-                ]);
-
-                if ($requestData['is_bulk_shipment'] == 1) {
-                    return ['status' => 'error', 'msg' => $errmsg ?? 'An error occurred.'];
-                }
-                return response()->json(['status' => 'error', 'msg' => $errmsg ?? 'An error occurred.']);
-            }
-
-			// Check for waybill (Unified API might not return upload_wbn)
-            if (empty($response['response']['packages'][0]['waybill'])) {
-                Log::error('Delhivery: Missing waybill in response', [
-                    'order_id' => $order->id,
-                    'full_response' => $response['response'] ?? null
-                ]);
-
-                if ($requestData['is_bulk_shipment'] == 1) {
-                    return ['status' => 'error', 'msg' => 'An error occurred (missing waybill).'];
-                }
-                return response()->json(['status' => 'error', 'msg' => 'An error occurred.']);
-            }
-
-            // Extract response data
-            $shipment_id = $response['response']['upload_wbn'] ?? rand(11111111111111, 99999999999999);
-            $lr_no = $order->order_prefix;
-            $awb_number = $response['response']['packages'][0]['waybill'] ?? rand(11111111111111, 99999999999999);
-
-            // Ensure shipment_id and awb_number are strings
-            if (is_array($shipment_id)) {
-                $shipment_id = reset($shipment_id);
-            }
-            if (is_array($awb_number)) {
-                $awb_number = reset($awb_number);
-            }
-
-            $courier_id = $response['response']['packages'][0]['refnum'] ?? null;
-            if (is_array($courier_id)) {
-                $courier_id = reset($courier_id);
-            }
-            $statusCourier = 'manifested';
-            $apiResponse = $response['response'] ?? null;
-
-
-            Log::info('Delhivery: Shipment created successfully', [
-                'order_id' => $order->id,
-                'order_prefix' => $order->order_prefix,
-                'shipment_id' => $shipment_id,
-                'awb_number' => $awb_number,
-                'courier_id' => $courier_id,
-                'lr_no' => $lr_no,
-                'status' => $statusCourier
-            ]);
-
-        }else {
+        } else {
             $awb_number = $this->generateLocalAwb($shippingCompany, $order);
             $shipment_id = 'LOCAL-' . $order->id . '-' . now()->format('YmdHis');
             $lr_no = $order->order_prefix;

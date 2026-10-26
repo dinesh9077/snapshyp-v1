@@ -6,8 +6,6 @@ use App\Models\RateCardDetail;
 use App\Models\RateCardMatrix;
 use App\Models\ZoneSetting;
 use App\Models\RateCard;
-use App\Models\DpWorldCluster;
-use App\Models\DpWorldRateCard;
 use App\Models\RateCardOtherCharge;
 use App\Models\OtherChargeMaster;
 use App\Models\ShippingCompany;
@@ -15,7 +13,6 @@ use App\Models\ShippingCompanyOdaCharge;
 use App\Models\ShippingCompanyOpaCharge;
 use App\Models\ShippingCompanyPincode;
 use Illuminate\Support\Facades\DB;
-use App\Services\ShipMozo;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use App\Models\CourierCommission;
@@ -24,57 +21,9 @@ use App\Models\UserCourierCommission;
 
 class RateCardService
 {
+    private array $managedDirectionCache = [];
+
     private const GST_PERCENT = 18;
-    private const ROUTX_TIME_KEYS = [
-        'ShippingTime',
-        'shipping_time',
-        'DeliveryTime',
-        'delivery_time',
-        'TAT',
-        'tat',
-        'TATDays',
-        'TatDays',
-        'tat_days',
-        'TransitDays',
-        'transit_days',
-        'EstimatedDays',
-        'estimated_days',
-        'ETA',
-        'eta',
-        'EDD',
-        'edd',
-        'ExpectedDeliveryDate',
-        'expected_delivery_date',
-        'EstimatedDeliveryDate',
-        'estimated_delivery_date',
-    ];
-
-    private const ROUTX_EXPECTED_PICKUP_KEYS = [
-        'ExpectedPickup',
-        'expectedPickup',
-        'expected_pickup',
-        'PickupDate',
-        'pickupDate',
-        'pickup_date',
-        'PickupOn',
-        'pickup_on',
-    ];
-
-    private const ROUTX_EXPECTED_DELIVERY_KEYS = [
-        'ExpectedDelivery',
-        'expectedDelivery',
-        'expected_delivery',
-        'ExpectedDeliveryDate',
-        'expected_delivery_date',
-        'expectedDeliveryDate',
-        'DeliveryDate',
-        'deliveryDate',
-        'delivery_date',
-        'ETA',
-        'eta',
-        'EDD',
-        'edd',
-    ];
 
     private function getRequestWeight($request, $isOrder = 0): float
     {
@@ -142,17 +91,6 @@ class RateCardService
         return $normalizedRateCardId;
     }
 
-    private function normalizeShippingTime($value)
-    {
-        if ($value === null || $value === '') {
-            return null;
-        }
-        if (is_numeric($value)) {
-            return rtrim(rtrim((string) $value, '0'), '.') . ' days';
-        }
-        return (string) $value;
-    }
-
     private function getChargeableWeight($request, int $isOrder = 0, array $otherCharges = []): float
     {
         $actualWeight = $this->getRequestWeight($request, $isOrder);
@@ -205,138 +143,6 @@ class RateCardService
         return $chargeableWeight;
     }
 
-    private function extractRoutxShippingTime(array $rate)
-    {
-        foreach (self::ROUTX_TIME_KEYS as $key) {
-            if (array_key_exists($key, $rate)) {
-                $value = $this->normalizeShippingTime($rate[$key]);
-                if (!empty($value)) {
-                    return $value;
-                }
-            }
-        }
-        return null;
-    }
-
-    private function extractRoutxExpectedPickup(array $rate)
-    {
-        foreach (self::ROUTX_EXPECTED_PICKUP_KEYS as $key) {
-            if (array_key_exists($key, $rate) && !empty($rate[$key])) {
-                return (string) $rate[$key];
-            }
-        }
-        return null;
-    }
-
-    private function extractRoutxExpectedDelivery(array $rate)
-    {
-        foreach (self::ROUTX_EXPECTED_DELIVERY_KEYS as $key) {
-            if (array_key_exists($key, $rate) && !empty($rate[$key])) {
-                return (string) $rate[$key];
-            }
-        }
-        return null;
-    }
-
-    private function getRoutxRateKey(array $rate): string
-    {
-        $carrierId = (string) ($rate['CarrierId'] ?? $rate['carrierId'] ?? '');
-        $serviceType = strtolower(trim((string) ($rate['ServiceType'] ?? $rate['serviceType'] ?? '')));
-
-        return $carrierId . '|' . $serviceType;
-    }
-
-    private function buildRoutxPrepaidComparisonMap(RoutxService $routxService, $shippingCompany, object $mockOrder): array
-    {
-        $comparisonOrder = clone $mockOrder;
-        $comparisonOrder->order_type = 'prepaid';
-        $comparisonOrder->cod_amount = 0;
-
-        $comparisonResponse = $routxService->rateCalculator($comparisonOrder, $shippingCompany);
-        if (!($comparisonResponse['success'] ?? false)) {
-            return [];
-        }
-
-        $comparisonData = $comparisonResponse['response']['data'] ?? $comparisonResponse['response'] ?? [];
-        if (isset($comparisonData['CarrierId']) || isset($comparisonData['carrierId'])) {
-            $comparisonData = [$comparisonData];
-        }
-
-        $comparisonMap = [];
-        foreach ($comparisonData as $comparisonRate) {
-            if (!is_array($comparisonRate)) {
-                continue;
-            }
-
-            $comparisonMap[$this->getRoutxRateKey($comparisonRate)] = (float) ($comparisonRate['TotalAmount'] ?? $comparisonRate['totalAmount'] ?? 0);
-        }
-
-        return $comparisonMap;
-    }
-
-    private function resolveRoutxChargeComponents(array $rate, bool $isCodOrder, array $prepaidComparisonMap = [], float $gstPercent = self::GST_PERCENT): array
-    {
-        $apiTotal = (float) ($rate['TotalAmount'] ?? $rate['totalAmount'] ?? 0);
-        $apiFreight = (float) ($rate['FreightCharges'] ?? $rate['freightCharges'] ?? $rate['ShippingCharges'] ?? $rate['shippingCharges'] ?? 0);
-        $apiCodCharges = (float) ($rate['CODCharges'] ?? $rate['codCharges'] ?? $rate['CODCharge'] ?? $rate['codCharge'] ?? 0);
-        $apiTax = (float) ($rate['GST'] ?? $rate['gst'] ?? $rate['Tax'] ?? $rate['tax'] ?? 0);
-
-        if ($apiFreight > 0 || $apiCodCharges > 0 || $apiTax > 0) {
-            if ($apiTotal <= 0) {
-                $apiTotal = $apiFreight + $apiCodCharges + $apiTax;
-            }
-
-            if ($apiFreight <= 0) {
-                $apiFreight = max(0, $apiTotal - $apiCodCharges - $apiTax);
-            }
-
-            if ($apiTax <= 0 && $apiTotal > 0) {
-                $apiTax = max(0, $apiTotal - $apiFreight - $apiCodCharges);
-            }
-
-            return [
-                'freight_charges' => round($apiFreight, 2),
-                'cod_charges' => round($isCodOrder ? $apiCodCharges : 0, 2),
-                'tax' => round($apiTax, 2),
-                'total_charges' => round($apiTotal, 2),
-            ];
-        }
-
-        if ($apiTotal <= 0) {
-            return [
-                'freight_charges' => 0,
-                'cod_charges' => 0,
-                'tax' => 0,
-                'total_charges' => 0,
-            ];
-        }
-
-        $comparisonTotal = $apiTotal;
-        if ($isCodOrder) {
-            $matchedPrepaidTotal = (float) ($prepaidComparisonMap[$this->getRoutxRateKey($rate)] ?? 0);
-            if ($matchedPrepaidTotal > 0) {
-                $comparisonTotal = $matchedPrepaidTotal;
-            }
-        }
-
-        $divisor = 1 + ($gstPercent / 100);
-        $baseFreight = round($comparisonTotal / $divisor, 2);
-        $codCharges = 0;
-
-        if ($isCodOrder && $apiTotal > $comparisonTotal) {
-            $codCharges = round(($apiTotal - $comparisonTotal) / $divisor, 2);
-        }
-
-        $tax = round($apiTotal - $baseFreight - $codCharges, 2);
-
-        return [
-            'freight_charges' => $baseFreight,
-            'cod_charges' => max(0, $codCharges),
-            'tax' => max(0, $tax),
-            'total_charges' => round($apiTotal, 2),
-        ];
-    }
-
     public function getRate($user, $shippingCompany, $request, $isOrder = 0, $extraData = [])
     {
         if (!$this->userCanAccessShippingCompany($user, $shippingCompany)) {
@@ -378,28 +184,10 @@ class RateCardService
 
         // Other Specialized API Rates (Usually B2C)
         if ($typeOfPackage == 1) {
-            if ($shippingCompany->id == 1) {
+            if ($shippingCompany->isShadowfax()) {
                 $sf = $this->getShadowfaxRate($user, $shippingCompany, $request, $isOrder, $extraData);
                 if ($sf)
                     $results = array_merge($results, $sf);
-                return $results ?: null;
-            }
-            if ($shippingCompany->id == 3) {
-                $dl = $this->getDelhiveryRate($user, $shippingCompany, $request, $isOrder, $extraData);
-                if ($dl)
-                    $results = array_merge($results, $dl);
-                return $results ?: null;
-            }
-            if ($shippingCompany->id == 2) {
-                $sm = $this->getShipMozoRate($user, $shippingCompany, $request, $isOrder, $extraData);
-                if ($sm)
-                    $results = array_merge($results, $sm);
-                return $results ?: null;
-            }
-            if ($shippingCompany->id == 6) {
-                $dp = $this->getDpWorldRate($user, $shippingCompany, $request, $isOrder, $extraData);
-                if ($dp)
-                    $results = array_merge($results, $dp);
                 return $results ?: null;
             }
         }
@@ -445,14 +233,21 @@ class RateCardService
     {
         $typeOfPackage = (int) ($request->type_of_package ?? 1);
         $requestedCompanyId = (int) ($request->company_id ?? 0);
-        $shippingCompanies = ShippingCompany::query()
-            ->whereStatus(1)
-            ->when($requestedCompanyId > 0, function ($query) use ($requestedCompanyId) {
-                $query->where('id', $requestedCompanyId);
-            })
-            ->get(['id']);
+        // Explain only the accounts this user can actually quote with
+        $shippingCompanies = ($user && $user->role === 'user')
+            ? ShippingCompany::availableFor($user)
+            : ShippingCompany::query()->whereStatus(1)->where('provider', '!=', 'other')->get(['id', 'name', 'provider']);
+        if ($requestedCompanyId > 0) {
+            $shippingCompanies = $shippingCompanies->where('id', $requestedCompanyId)->values();
+        }
 
         $detailedReasons = [];
+        $blockedPincodeMessages = [
+            'pickup' => 'Pickup pincode ' . trim((string) ($request->pickup_code ?? $request->pickup_pincode ?? '')) . ' is not serviceable.',
+            'delivery' => 'Delivery pincode ' . trim((string) ($request->delivery_code ?? $request->delivery_pincode ?? '')) . ' is not serviceable.',
+            'cod' => 'COD is not available on delivery pincode ' . trim((string) ($request->delivery_code ?? $request->delivery_pincode ?? '')) . '.',
+        ];
+        $blockReasons = [];
 
         if ($typeOfPackage !== 2) {
             $pickupCode = trim((string) ($request->pickup_code ?? $request->pickup_pincode ?? ''));
@@ -466,8 +261,10 @@ class RateCardService
             foreach ($shippingCompanies as $shippingCompany) {
                 $shippingCompanyId = (int) $shippingCompany->id;
                 $shippingCompanyLabel = $shippingCompany->name ?: (string) $shippingCompanyId;
-                if (!$this->passesManagedPincodeFilter($shippingCompanyId, $request, $extraData)) {
-                    $detailedReasons[] = "Courier {$shippingCompanyLabel}: Pincode inactive";
+                $blockReason = $this->managedPincodeBlockReason($shippingCompanyId, $request, $extraData);
+                if ($blockReason !== null) {
+                    $blockReasons[] = $blockReason;
+                    $detailedReasons[] = "Courier {$shippingCompanyLabel}: " . $blockedPincodeMessages[$blockReason];
                     continue;
                 }
 
@@ -497,10 +294,14 @@ class RateCardService
             }
 
             if ($pincodeInactive) {
-                return 'Pincode(s) inactive for all couriers.';
+                return !empty($blockReasons)
+                    ? $blockedPincodeMessages[$blockReasons[0]]
+                    : 'No courier is available for this route.';
             }
             if ($hasZoneMatch) {
-                return 'Pincodes serviceable but no B2C rates configured. Details: ' . implode('; ', $detailedReasons);
+                return !empty($detailedReasons)
+                    ? 'Pincodes serviceable but no B2C rates configured. Details: ' . implode('; ', $detailedReasons)
+                    : 'No rate found for this route and weight.';
             }
             if ($hasManagedPincodeMatch) {
                 return 'Pincodes active but no B2C zone mapped. Details: ' . implode('; ', $detailedReasons);
@@ -684,21 +485,43 @@ class RateCardService
 
     private function passesManagedPincodeFilter(int $shippingCompanyId, $request, array $extraData = []): bool
     {
+        return $this->managedPincodeBlockReason($shippingCompanyId, $request, $extraData) === null;
+    }
+
+    /**
+     * Why Manage Pincode rules out this route for the account: 'pickup', 'delivery' or 'cod'; null when allowed.
+     * Same rule as the Manage Pincode page and rate calculator.
+     */
+    private function managedPincodeBlockReason(int $shippingCompanyId, $request, array $extraData = []): ?string
+    {
         if (!Schema::hasTable('shipping_company_pincodes')) {
-            return true;
+            return null;
         }
 
-        if (in_array($shippingCompanyId, [1, 2, 3])) {
-            return true;
+        [$pickupCode, $deliveryCode] = $this->routePincodes($request);
+        if ($pickupCode === '' || $deliveryCode === '') {
+            return null;
         }
 
-        $hasManagedMappings = ShippingCompanyPincode::where('shipping_company_id', $shippingCompanyId)
-            ->where('status', 1)
-            ->exists();
-        if (!$hasManagedMappings) {
-            return true;
+        if (!$this->isPincodeServiceable($shippingCompanyId, $pickupCode, 'from', $extraData)) {
+            return 'pickup';
+        }
+        if (!$this->isPincodeServiceable($shippingCompanyId, $deliveryCode, 'to', $extraData)) {
+            return 'delivery';
         }
 
+        $paymentType = strtolower((string) ($request->payment_type ?? $request->order_type ?? ''));
+        $isCodOrder = in_array($paymentType, ['cod', '2'], true);
+        if ($isCodOrder && Schema::hasColumn('shipping_company_pincodes', 'cod_enabled')
+            && !$this->isManagedPincodeCodAllowed($shippingCompanyId, $deliveryCode, $extraData)) {
+            return 'cod';
+        }
+
+        return null;
+    }
+
+    private function routePincodes($request): array
+    {
         $pickupCode = trim((string) (
             $request->pickup_code
             ?? $request->pickup_pincode
@@ -713,27 +536,41 @@ class RateCardService
             ?? ''
         ));
 
-        if ($pickupCode === '' || $deliveryCode === '') {
-            return true;
+        return [$pickupCode, $deliveryCode];
+    }
+
+    /**
+     * Manage Pincode rule: an account with no rows for a direction serves every pincode; otherwise a pincode
+     * is serviceable unless its row is set to a not-serviceable mode (drop / no_pickup, pickup / no_delivery).
+     */
+    public function isPincodeServiceable(int $shippingCompanyId, string $pincode, string $direction, array $extraData = []): bool
+    {
+        if ($shippingCompanyId <= 0 || !Schema::hasTable('shipping_company_pincodes')) {
+            return $shippingCompanyId > 0;
         }
 
-        if (
-            !$this->isManagedPincodeAllowed($shippingCompanyId, 'from', $pickupCode, $extraData)
-            || !$this->isManagedPincodeAllowed($shippingCompanyId, 'to', $deliveryCode, $extraData)
-        ) {
+        $zipcode = $this->resolveManagedPincodeZipcode($pincode, $extraData);
+        if (!$zipcode) {
             return false;
         }
 
-        $paymentType = strtolower((string) ($request->payment_type ?? $request->order_type ?? ''));
-        $isCodOrder = in_array($paymentType, ['cod', '2'], true);
-
-        if (!$isCodOrder || !Schema::hasColumn('shipping_company_pincodes', 'cod_enabled')) {
+        $cacheKey = $shippingCompanyId . ':' . $direction;
+        if (!array_key_exists($cacheKey, $this->managedDirectionCache)) {
+            $this->managedDirectionCache[$cacheKey] = ShippingCompanyPincode::where('shipping_company_id', $shippingCompanyId)
+                ->where('direction', $direction)
+                ->exists();
+        }
+        if (!$this->managedDirectionCache[$cacheKey]) {
             return true;
         }
 
-        return $this->isManagedPincodeCodAllowed($shippingCompanyId, $deliveryCode, $extraData);
-    }
+        $serviceMode = ShippingCompanyPincode::where('shipping_company_id', $shippingCompanyId)
+            ->where('pincode_id', $zipcode->id)
+            ->where('direction', $direction)
+            ->value('service_mode');
 
+        return in_array((string) $serviceMode, ['', 'none', 'door'], true);
+    }
     private function enrichCourierResultsWithManagedPincodeData(array $results, int $shippingCompanyId, $request, array $extraData = []): array
     {
         if (empty($results) || !$this->hasManagedPincodeMetaColumns()) {
@@ -818,15 +655,7 @@ class RateCardService
             return false;
         }
 
-        $isRoutxCompany = (int) ($shippingCompany->id ?? 0) === 1
-            || str_contains(strtolower((string) ($shippingCompany->name ?? '')), 'routx')
-            || str_contains(strtolower((string) ($shippingCompany->url ?? '')), 'routxmitra');
-
-        if (!$isRoutxCompany) {
-            return true;
-        }
-
-        return !method_exists($user, 'canAccessRoutx') || $user->canAccessRoutx();
+        return true;
     }
 
     private function getManagedPincodeRequestCodes($request): array
@@ -1074,65 +903,20 @@ class RateCardService
             && Schema::hasColumn('shipping_company_pincodes', 'opa_charge_id');
     }
 
-    private function isManagedPincodeAllowed(int $shippingCompanyId, string $direction, string $pincode, array $extraData = []): bool
-    {
-        $pincode = $this->normalizePincodeValue($pincode);
-        if ($pincode === '') {
-            return false;
-        }
-
-        $baseQuery = ShippingCompanyPincode::where('shipping_company_id', $shippingCompanyId)
-            ->where('direction', $direction);
-
-        $zipcodes = $extraData['zipcodes'] ?? collect();
-        $zipcode = $zipcodes[$pincode] ?? null;
-
-        if (!$zipcode) {
-            $zipcode = DB::table('zipcodes')
-                ->select('id', 'pincode', 'city', 'state')
-                ->where('pincode', $pincode)
-                ->first();
-        }
-
-        if (!$zipcode) {
-            return false;
-        }
-
-        return $baseQuery
-            ->where('pincode_id', $zipcode->id)
-            ->where('status', 1)
-            ->exists();
-    }
-
+    // COD is off only where the delivery row explicitly disables it
     private function isManagedPincodeCodAllowed(int $shippingCompanyId, string $pincode, array $extraData = []): bool
     {
-        $pincode = $this->normalizePincodeValue($pincode);
-        if ($pincode === '') {
-            return false;
-        }
-
-        $zipcodes = $extraData['zipcodes'] ?? collect();
-        $zipcode = $zipcodes[$pincode] ?? null;
-
-        if (!$zipcode) {
-            $zipcode = DB::table('zipcodes')
-                ->select('id', 'pincode', 'city', 'state')
-                ->where('pincode', $pincode)
-                ->first();
-        }
-
+        $zipcode = $this->resolveManagedPincodeZipcode($pincode, $extraData);
         if (!$zipcode) {
             return false;
         }
 
-        return ShippingCompanyPincode::where('shipping_company_id', $shippingCompanyId)
+        return !ShippingCompanyPincode::where('shipping_company_id', $shippingCompanyId)
             ->where('pincode_id', $zipcode->id)
             ->where('direction', 'to')
-            ->where('status', 1)
-            ->where('cod_enabled', 1)
+            ->where('cod_enabled', 0)
             ->exists();
     }
-
     private function normalizeCourierResults(array $results, $request): array
     {
         $defaultOrderId = $request->order_id ?? null;
@@ -1201,8 +985,8 @@ class RateCardService
         $zoneSettingId = $this->getZoneSettingId($pickupCode, $deliveryCode, $shippingCompany->id, $extraData);
         $minimumWeight = $this->getMinimumWeight($maxWeight);
 
-        // If no zone found for priority couriers (1: Shadowfax, 3: Delhivery), try to get any available zone
-        if (!$zoneSettingId && in_array($shippingCompany->id, [1, 3])) {
+        // If no zone found for the priority courier (1: Shadowfax), try to get any available zone
+        if (!$zoneSettingId && $shippingCompany->isShadowfax()) {
             $fallbackZone = ZoneSetting::where('shipping_company_id', $shippingCompany->id)
                 ->where('rate_type', 'b2c')
                 ->orderBy('sort_order', 'asc')
@@ -1294,7 +1078,7 @@ class RateCardService
             $roundedTotalCharges = round((float) $totalWithTax, 2);
             $roundOffAmount = $roundedTotalCharges - $totalWithTax;
 
-            $basePlan = (in_array($shippingCompany->id, [3, 4, 5])) ? $this->getBasePlan($maxWeight, $shippingCompany->name ?? null) : null;
+            $basePlan = null;
             $groupName = $rateCardDetail->rateCard ? $rateCardDetail->rateCard->group_name : "";
             $displayName = ($basePlan ?: $shippingCompany->name) . ($groupName ? " (" . str_ireplace(' plan', '', $groupName) . ")" : "");
 
@@ -1609,18 +1393,6 @@ class RateCardService
         return 20;
     }
 
-    public function getBasePlan(float $maxWeight, ?string $companyName = null)
-    {
-        $companyPrefix = trim((string) $companyName);
-        $companyPrefix = $companyPrefix !== '' ? $companyPrefix . ' - ' : '';
-
-        if ($maxWeight <= 5) {
-            return $companyPrefix . 'SMALL';
-        } else {
-            return $companyPrefix . 'Heavy';
-        }
-    }
-
     public function getZoneSettingId(?string $pickupCode, ?string $deliveryCode, int $companyId, $extraData = [])
     {
         $pickupCode = $this->normalizePincodeValue($pickupCode);
@@ -1753,8 +1525,8 @@ class RateCardService
             }
         }
 
-        // Last resort for priority couriers (1: Shadowfax, 3: Delhivery)
-        if (in_array($companyId, [1, 3])) {
+        // Last resort for the priority courier (1: Shadowfax)
+        if (\App\Models\ShippingCompany::isShadowfaxId($companyId)) {
             $lastResort = ZoneSetting::where('shipping_company_id', $companyId)
                 ->where('rate_type', 'b2c')
                 ->orderBy('sort_order', 'asc')
@@ -1765,233 +1537,6 @@ class RateCardService
         }
 
         return null;
-    }
-
-    public function getDpWorldRate($user, $shippingCompany, $request, $isOrder = 0, $extraData = [])
-    {
-        $pickupCode = $request->pickup_code;
-        $deliveryCode = $request->delivery_code;
-        $requestedWeight = $this->getRequestWeight($request, $isOrder);
-        $paymentType = $request->payment_type;
-        $codAmount = $request->cod_amount;
-
-        $otherCharges = $this->getOtherChargesForRateCard(0, (int) $shippingCompany->id); // DpWorld usually uses default/user charges
-        $divisor = $this->getDivisorFromCharges($otherCharges, 5000);
-        $totalVolumetricWeight = $this->calculateVolumetricWeight($request, $divisor, $isOrder);
-
-        $maxWeight = max([(float) $requestedWeight, (float) $totalVolumetricWeight]);
-        $minimumWeight = 20;
-
-        $pickupZipCode = DB::table('zipcodes')
-            ->select('id', 'pincode', 'city', 'state')
-            ->where('pincode', $pickupCode)
-            ->first();
-
-        $deliverZipCode = DB::table('zipcodes')
-            ->select('id', 'pincode', 'city', 'state')
-            ->where('pincode', $deliveryCode)
-            ->first();
-
-        if (!$pickupZipCode || !$deliverZipCode)
-            return null;
-
-        $fromZone = DpWorldCluster::where(function ($query) use ($pickupZipCode) {
-            $query->whereJsonContains('cities', $pickupZipCode->city)
-                ->orWhereJsonContains('states', $pickupZipCode->state);
-        })->first();
-
-        $toZone = DpWorldCluster::where(function ($query) use ($deliverZipCode) {
-            $query->whereJsonContains('cities', $deliverZipCode->city)
-                ->orWhereJsonContains('states', $deliverZipCode->state);
-        })->first();
-
-        if (!$fromZone || !$toZone)
-            return null;
-
-        $rate = DpWorldRateCard::where('from_zone_id', $fromZone->id)
-            ->where('to_zone_id', $toZone->id)
-            ->value('price') ?? 0;
-
-        $totalCharges = $rate * max($minimumWeight, $maxWeight);
-
-        if ($totalCharges <= 0) {
-            return null;
-        }
-
-        $codCharges = 0;
-        $payTypeStr = strtolower((string) ($paymentType ?? '1'));
-        if ($payTypeStr === 'cod' || $payTypeStr === '2') {
-            $invAmount = $request->inv_amount ?? $request->invoice_amount ?? $request->order_amount ?? 0;
-            $baseAmount = max((float) $codAmount, (float) $invAmount);
-            // Defaulting to 0 for DpWorld since no rate card specifics are returned and base 0 from shipfigo logic
-            $codCharges = 0;
-        }
-        $rateCardId = $this->resolveRateCardId($user, 1);
-        $otherCharges = $this->getOtherChargesForRateCard((int) $rateCardId, (int) $shippingCompany->id);
-        $managedPincodeMetadata = $this->getManagedPincodeMetadataFromContext((int) $shippingCompany->id, $request, $extraData);
-        $rateCardChargeData = $this->prepareB2cRateCardCharges($otherCharges, $totalCharges, $maxWeight, (float) $codAmount, $request, $managedPincodeMetadata);
-        $totalCharges = $rateCardChargeData['freight'];
-        $codCharges += $rateCardChargeData['cod_charges'];
-        $rateCardOverheads = $rateCardChargeData['overhead_total'];
-        $overheadDetails = $rateCardChargeData['overhead_details'];
-        $gstPercent = $rateCardChargeData['gst_percent'];
-
-        $commissions = $extraData['commissions'] ?? null;
-        $commissionData = $this->applyCourierCommission($user, $shippingCompany, $totalCharges, null, $commissions);
-        $b2cCharges = $this->applyB2cUserChargeBreakup($commissionData, $totalCharges, $codCharges, $paymentType);
-        $baseFreight = $b2cCharges['freight_charges'];
-        $codCharges = $b2cCharges['cod_charges'];
-
-        $taxableAmount = $baseFreight + $codCharges + $rateCardOverheads;
-        $tax = ($taxableAmount * $gstPercent) / 100;
-        $totalWithTax = $taxableAmount + $tax;
-        $roundedTotalFinal = round($totalWithTax, 2);
-        $roundOffAmount = $roundedTotalFinal - $totalWithTax;
-
-        return [
-            [
-                'direct_rate' => $baseFreight,
-                'order_id' => $request->order_id ?? null,
-                'tax' => $tax,
-                'round_off' => $roundOffAmount,
-                'shipping_company_id' => $shippingCompany->id,
-                'shipping_company_name' => $shippingCompany->name,
-                'shipping_company_logo' => asset('storage/shipping-logo/' . $shippingCompany->logo),
-                'courier_id' => 'LOCAL-' . $shippingCompany->id,
-                'courier_name' => $shippingCompany->name,
-                'freight_charges' => $baseFreight,
-                'cod_charges' => $codCharges,
-                'total_charges' => $roundedTotalFinal,
-                'rto_charge' => 0,
-                'min_weight' => $minimumWeight,
-                'chargeable_weight' => $maxWeight,
-                'applicable_weight' => $maxWeight ?? 0,
-                'percentage_amount' => $rateCardOverheads,
-                'responseData' => [
-                    'order_id' => $request->order_id ?? null,
-                    'shipping_company_id' => $shippingCompany->id,
-                    'courier_id' => 'LOCAL-' . $shippingCompany->id,
-                    'chargeable_weight' => $maxWeight,
-                    'applicable_weight' => $maxWeight ?? 0,
-                    'total_charges' => $roundedTotalFinal,
-                    'base_plan' => (in_array($shippingCompany->id, [3, 4, 5])) ? $this->getBasePlan($maxWeight, $shippingCompany->name ?? null) : null,
-                    'courier_name' => $shippingCompany->name,
-                    'base_freight' => $baseFreight,
-                    'freight_charges' => $baseFreight,
-                    'cod_charges' => $codCharges,
-                    'tax' => $tax,
-                    'additional_charges' => $rateCardOverheads,
-                    'overhead_details' => $overheadDetails,
-                    'gst_percent' => $gstPercent,
-                ]
-            ]
-        ];
-    }
-
-    public function getShipMozoRate($user, $shippingCompany, $request, $isOrder = 0, $extraData = [])
-    {
-        try {
-            $shipMozoService = new ShipMozo();
-            $requestData = $request->all();
-            $requestData['pickup_code'] = $request->pickup_code;
-            $requestData['delivery_code'] = $request->delivery_code;
-            $requestData['type'] = (in_array($request->payment_type, ['Prepaid', 'prepaid', 1, '1'])) ? 1 : 2;
-            $requestData['cod_amount'] = (float) $request->cod_amount;
-            $requestData['weight'] = $this->getRequestWeight($request, $isOrder);
-            $requestData['inv_amount'] = (float) ($request->order_amount ?? $request->invoice_amount ?? 0);
-            $requestData['type_of_package'] = 1;
-
-            $response = $shipMozoService->rateCaculator($requestData, $shippingCompany);
-            if (!($response['success'] ?? false))
-                return null;
-
-            $apiData = $response['response']['data'] ?? null;
-            if (!$apiData)
-                return null;
-            if (isset($apiData['total_charges']))
-                $apiData = [$apiData];
-
-            $couriers = [];
-            $chargeableWeight = $this->getChargeableWeight($request, $isOrder);
-            $rateCardId = $this->resolveRateCardId($user, 1);
-            $otherCharges = $this->getOtherChargesForRateCard((int) $rateCardId, (int) $shippingCompany->id);
-            $managedPincodeMetadata = $this->getManagedPincodeMetadataFromContext((int) $shippingCompany->id, $request, $extraData);
-            foreach ($apiData as $bestRate) {
-                if (stripos((string) ($bestRate['name'] ?? ''), 'Lyle Snyder') !== false)
-                    continue;
-
-                $totalCharges = (float) ($bestRate['total_charges'] ?? 0);
-                $apiCodCharges = (float) ($bestRate['cod_charges'] ?? $bestRate['cod_charge'] ?? 0);
-                $shippingCharges = (float) ($bestRate['shipping_charges'] ?? ($bestRate['freight_charges'] ?? 0));
-                $apiTax = (float) ($bestRate['gst'] ?? ($bestRate['tax'] ?? 0));
-
-                $freightCharges = $shippingCharges > 0 ? $shippingCharges : max(0, $totalCharges - $apiTax - $apiCodCharges);
-                if ($totalCharges <= 0)
-                    continue;
-
-                $payTypeStr = strtolower((string) ($request->payment_type ?? '1'));
-                if ($payTypeStr === 'cod' || $payTypeStr === '2') {
-                    $codCharges = $apiCodCharges; // From shipmozo api logic overrides
-                } else {
-                    $codCharges = 0;
-                }
-
-                $rateCardChargeData = $this->prepareB2cRateCardCharges($otherCharges, $freightCharges, $chargeableWeight, (float) ($request->cod_amount ?? 0), $request, $managedPincodeMetadata);
-                $freightCharges = $rateCardChargeData['freight'];
-                $codCharges += $rateCardChargeData['cod_charges'];
-                $rateCardOverheads = $rateCardChargeData['overhead_total'];
-                $overheadDetails = $rateCardChargeData['overhead_details'];
-                $gstPercent = $rateCardChargeData['gst_percent'];
-
-                $commissionAmount = 0;
-                $commissions = $extraData['commissions'] ?? null;
-                $commissionData = $this->applyCourierCommission($user, $shippingCompany, $freightCharges, $bestRate['id'] ?? null, $commissions);
-                $b2cCharges = $this->applyB2cUserChargeBreakup($commissionData, $freightCharges, $codCharges, $request->payment_type ?? '1');
-                $freightCharges = $b2cCharges['freight_charges'];
-                $codCharges = $b2cCharges['cod_charges'];
-
-                $taxableAmount = $freightCharges + $codCharges + $rateCardOverheads;
-                $tax = ($taxableAmount * $gstPercent) / 100;
-                $finalTotalCharges = round($taxableAmount + $tax, 2);
-
-                $couriers[] = [
-                    'direct_rate' => $freightCharges,
-                    'order_id' => $request->order_id ?? null,
-                    'tax' => $tax,
-                    'round_off' => 0,
-                    'shipping_company_id' => $shippingCompany->id,
-                    'shipping_company_name' => $shippingCompany->name,
-                    'shipping_company_logo' => $bestRate['image'] ?? asset('storage/shipping-logo/' . $shippingCompany->logo),
-                    'courier_id' => $bestRate['id'] ?? '',
-                    'courier_name' => $bestRate['name'] ?? $shippingCompany->name,
-                    'freight_charges' => $freightCharges,
-                    'cod_charges' => $codCharges,
-                    'total_charges' => $finalTotalCharges,
-                    'rto_charge' => 0,
-                    'min_weight' => 0,
-                    'chargeable_weight' => $chargeableWeight,
-                    'applicable_weight' => $chargeableWeight,
-                    'percentage_amount' => $rateCardOverheads,
-                    'responseData' => array_merge($bestRate, [
-                        'base_plan' => (in_array($shippingCompany->id, [3, 4, 5])) ? $this->getBasePlan($chargeableWeight, $shippingCompany->name ?? null) : null,
-                        'courier_name' => $bestRate['name'] ?? $shippingCompany->name,
-                        'base_freight' => $freightCharges,
-                        'cod_charges' => $codCharges,
-                        'tax' => $tax,
-                        'total_charges' => $finalTotalCharges,
-                        'additional_charges' => $rateCardOverheads,
-                        'freight_charges' => $freightCharges,
-                        'chargeable_weight' => $chargeableWeight,
-                        'overhead_details' => $overheadDetails,
-                        'gst_percent' => $gstPercent,
-                    ])
-                ];
-            }
-            return $couriers;
-        } catch (\Exception $e) {
-            Log::error('ShipMozo Error: ' . $e->getMessage());
-            return null;
-        }
     }
 
     public function getShadowfaxRate($user, $shippingCompany, $request, $isOrder = 0, $extraData = [])
@@ -2018,136 +1563,6 @@ class RateCardService
         } catch (\Exception $e) {
             Log::error('Shadowfax Rate Error', ['msg' => $e->getMessage()]);
             // Last resort: try matrix rate
-            try {
-                return $this->getStandardMatrixRate($user, $shippingCompany, $request, $isOrder, $extraData);
-            } catch (\Exception $innerEx) {
-                return null;
-            }
-        }
-    }
-
-    public function getDelhiveryRate($user, $shippingCompany, $request, $isOrder = 0, $extraData = [])
-    {
-        try {
-            $delhiveryB2CService = app(\App\Services\DelhiveryB2CService::class);
-            $pickupCode = $request->pickup_code;
-            $deliveryCode = $request->delivery_code;
-
-            // 1. Check Serviceability via API
-            $serviceability = $delhiveryB2CService->pincodeService($deliveryCode, $shippingCompany);
-            $apiServiceable = $serviceability['success'] ?? false;
-
-            // 2. Fetch Rate via API (only if serviceable)
-            $apiRateSuccess = false;
-            $apiRateData = null;
-
-            if ($apiServiceable) {
-                $requestData = [
-                    'pickup_code' => $pickupCode,
-                    'delivery_code' => $deliveryCode,
-                    'weight' => $this->getRequestWeight($request, $isOrder),
-                    'payment_type' => $request->payment_type ?? 'prepaid',
-                    'cod_amount' => (float) ($request->cod_amount ?? 0),
-                ];
-                $response = $delhiveryB2CService->rateCaculator($requestData, $shippingCompany);
-                $apiRateSuccess = ($response['success'] ?? false) && !empty($response['response']);
-                if ($apiRateSuccess) {
-                    $apiRateData = $response['response'];
-                }
-            }
-
-            // If API serviceability or rate fails, try internal matrix rate as fallback
-            if (!$apiServiceable || !$apiRateSuccess || empty($apiRateData)) {
-                Log::info('Delhivery API check failed or returned empty, trying internal matrix rate', [
-                    'pickup' => $pickupCode,
-                    'delivery' => $deliveryCode,
-                    'api_serviceable' => $apiServiceable,
-                    'api_rate_success' => $apiRateSuccess
-                ]);
-
-                $matrixResults = $this->getStandardMatrixRate($user, $shippingCompany, $request, $isOrder, $extraData);
-                if ($matrixResults) {
-                    return $matrixResults;
-                }
-
-                // If no matrix rate either, return null
-                if (!$apiServiceable) {
-                    return null;
-                }
-                // If serviceable but no API rate and no matrix rate, use empty data
-                $apiRateData = $apiRateData ?? [];
-            }
-
-            // Delhivery B2C rateCaculator typically returns list of services or single object
-            if (isset($apiRateData[0])) { $apiRateData = $apiRateData[0]; }
-
-            $apiFreight = (float) ($apiRateData['charge_DL'] ?? 0);
-            $apiDph = (float) ($apiRateData['charge_DPH'] ?? 0);
-            $apiCodCharges = (float) ($apiRateData['charge_COD'] ?? 0);
-            
-            $apiTax = 0;
-            if (!empty($apiRateData['tax_data']) && is_array($apiRateData['tax_data'])) {
-                $apiTax = (float) array_sum($apiRateData['tax_data']);
-            }
-
-            $chargeableWeight = $this->getChargeableWeight($request, $isOrder);
-            $rateCardId = $this->resolveRateCardId($user, 1);
-            $otherCharges = $this->getOtherChargesForRateCard((int) $rateCardId, (int) $shippingCompany->id);
-            $managedPincodeMetadata = $this->getManagedPincodeMetadataFromContext((int) $shippingCompany->id, $request, $extraData);
-
-            $baseRateForMarkup = $apiFreight + $apiDph;
-            $rateCardChargeData = $this->prepareB2cRateCardCharges($otherCharges, $baseRateForMarkup, $chargeableWeight, (float) ($request->cod_amount ?? 0), $request, $managedPincodeMetadata);
-            $markedUpFreight = $rateCardChargeData['freight'];
-            $apiCodCharges += $rateCardChargeData['cod_charges'];
-            $rateCardOverheads = $rateCardChargeData['overhead_total'];
-            $overheadDetails = $rateCardChargeData['overhead_details'];
-            $gstPercent = $rateCardChargeData['gst_percent'];
-
-            $commissions = $extraData['commissions'] ?? null;
-            $commissionData = $this->applyCourierCommission($user, $shippingCompany, $markedUpFreight, null, $commissions);
-            $b2cCharges = $this->applyB2cUserChargeBreakup($commissionData, $markedUpFreight, $apiCodCharges, $request->payment_type ?? '1');
-            $finalFreight = $b2cCharges['freight_charges'];
-            $finalCod = $b2cCharges['cod_charges'];
-
-            $taxableAmount = $finalFreight + $finalCod + $rateCardOverheads;
-            $tax = ($taxableAmount * $gstPercent) / 100;
-            $finalTotal = round($taxableAmount + $tax, 2);
-
-            return [
-                [
-                    'direct_rate' => $finalFreight,
-                    'order_id' => $request->order_id ?? null,
-                    'tax' => $tax,
-                    'round_off' => 0,
-                    'shipping_company_id' => $shippingCompany->id,
-                    'shipping_company_name' => $shippingCompany->name,
-                    'shipping_company_logo' => asset('storage/shipping-logo/' . $shippingCompany->logo),
-                    'courier_name' => $shippingCompany->name,
-                    'freight_charges' => $finalFreight,
-                    'cod_charges' => $finalCod,
-                    'total_charges' => $finalTotal,
-                    'min_weight' => 0,
-                    'chargeable_weight' => $chargeableWeight,
-                    'applicable_weight' => $chargeableWeight,
-                    'percentage_amount' => $rateCardOverheads,
-                    'responseData' => array_merge($apiRateData, [
-                        'base_plan' => $this->getBasePlan($chargeableWeight, $shippingCompany->name),
-                        'courier_name' => $shippingCompany->name,
-                        'base_freight' => $finalFreight,
-                        'cod_charges' => $finalCod,
-                        'tax' => $tax,
-                        'total_charges' => $finalTotal,
-                        'additional_charges' => $rateCardOverheads,
-                        'overhead_details' => $overheadDetails,
-                        'gst_percent' => $gstPercent,
-                        'chargeable_weight' => $chargeableWeight,
-                        'api_response' => $apiRateData
-                    ])
-                ]
-            ];
-        } catch (\Exception $e) {
-            Log::error('Delhivery Rate Error', ['msg' => $e->getMessage()]);
-            // Fallback to matrix rate on exception
             try {
                 return $this->getStandardMatrixRate($user, $shippingCompany, $request, $isOrder, $extraData);
             } catch (\Exception $innerEx) {
@@ -2208,229 +1623,6 @@ class RateCardService
         } catch (\Exception $e) {
             Log::error('Shadowfax Serviceability Error in RateCardService: ' . $e->getMessage());
             return false;
-        }
-    }
-
-    public function getRoutxRate($user, $shippingCompany, $request, $isOrder = 0, $extraData = [])
-    {
-        try {
-            $routxService = app(RoutxService::class);
-            $weightOrder = $request->weight_order ?? $request->type_of_package ?? 1;
-            $b2bRateCardId = $this->resolveRateCardId($user, 2);
-            $b2cRateCardId = $this->resolveRateCardId($user, 1);
-            $otherChargesForB2B = null;
-            $otherChargesForB2C = $this->getOtherChargesForRateCard((int) $b2cRateCardId, (int) $shippingCompany->id);
-            $managedPincodeMetadata = $this->getManagedPincodeMetadataFromContext((int) $shippingCompany->id, $request, $extraData);
-            if ($weightOrder == 2 && $b2bRateCardId) {
-                $otherChargesForB2B = $this->getOtherChargesForRateCard((int) $b2bRateCardId, (int) $shippingCompany->id);
-            }
-            $chargeableWeight = $this->getChargeableWeight($request, $isOrder, $otherChargesForB2B ?? []);
-
-            $mockOrder = (object) [
-                'weight_order' => $weightOrder,
-                'length' => (is_array($request->length) ? ($request->length[0] ?? 0) : ($request->length ?? 0)),
-                'width' => (is_array($request->width) ? ($request->width[0] ?? 0) : ($request->width ?? 0)),
-                'height' => (is_array($request->height) ? ($request->height[0] ?? 0) : ($request->height ?? 0)),
-                'weight' => $this->getRequestWeight($request, $isOrder),
-                'order_type' => $request->payment_type ?? 'Prepaid',
-                'cod_amount' => $request->cod_amount ?? 0,
-                'invoice_amount' => $request->inv_amount ?? $request->invoice_amount ?? 0,
-                'has_insurance' => $request->insurance ?? false,
-                'is_appointment_delivery' => $request->delivery_appointment ?? false,
-                'warehouse' => (object) ['zip_code' => $request->pickup_code],
-                'customerAddress' => (object) ['zip_code' => $request->delivery_code],
-                'orderItems' => $request->orderItems ?? collect()
-            ];
-
-            if ($weightOrder == 2 && !$isOrder) {
-                // For B2B in rate calculator, populate orderItems from arrays
-                $items = collect();
-                $lengths = $request->length ?? [];
-                if (is_array($lengths)) {
-                    foreach ($lengths as $key => $len) {
-                        $items->push((object) [
-                            'dimensions' => [
-                                'length' => (float) $len,
-                                'width' => (float) ($request->width[$key] ?? 0),
-                                'height' => (float) ($request->height[$key] ?? 0),
-                                'no_of_box' => (int) ($request->box[$key] ?? 1),
-                                'weight' => is_array($request->weight) ? (float) ($request->weight[$key] ?? 0) : ((float) $request->weight / count($lengths))
-                            ]
-                        ]);
-                    }
-                }
-                $mockOrder->orderItems = $items;
-            }
-
-            $response = $routxService->rateCalculator($mockOrder, $shippingCompany);
-            if (!($response['success'] ?? false))
-                return null;
-
-            $apiData = $response['response']['data'] ?? $response['response'] ?? [];
-            if (isset($apiData['CarrierId']))
-                $apiData = [$apiData];
-
-            $isCodOrder = in_array(strtolower((string) ($request->payment_type ?? '1')), ['cod', '2'], true);
-            $prepaidComparisonMap = $isCodOrder
-                ? $this->buildRoutxPrepaidComparisonMap($routxService, $shippingCompany, $mockOrder)
-                : [];
-
-            $couriers = [];
-            foreach ($apiData as $rate) {
-                if (!is_array($rate))
-                    continue;
-                $resolvedChargeData = $this->resolveRoutxChargeComponents($rate, $isCodOrder, $prepaidComparisonMap);
-                $freightCharges = (float) ($resolvedChargeData['freight_charges'] ?? 0);
-                $codCharges = (float) ($resolvedChargeData['cod_charges'] ?? 0);
-                $tax = (float) ($resolvedChargeData['tax'] ?? 0);
-                $totalCharges = (float) ($resolvedChargeData['total_charges'] ?? 0);
-
-                $shippingTime = $this->extractRoutxShippingTime($rate);
-                $expectedPickup = $this->extractRoutxExpectedPickup($rate);
-                $expectedDelivery = $this->extractRoutxExpectedDelivery($rate);
-
-                $couriers[] = [
-                    'direct_rate' => $freightCharges,
-                    'order_id' => $request->order_id ?? null,
-                    'tax' => $tax,
-                    'round_off' => 0,
-                    'shipping_company_id' => $shippingCompany->id,
-                    'shipping_company_name' => $shippingCompany->name,
-                    'shipping_company_logo' => asset('storage/shipping-logo/' . $shippingCompany->logo),
-                    'courier_id' => $rate['CarrierId'] ?? $rate['carrierId'] ?? '',
-                    'courier_name' => $rate['ServiceType'] ?? $rate['serviceType'] ?? $shippingCompany->name,
-                    'shipping_time' => $shippingTime,
-                    'expected_pickup' => $expectedPickup,
-                    'expected_delivery' => $expectedDelivery,
-                    'freight_charges' => $freightCharges,
-                    'cod_charges' => $codCharges,
-                    'total_charges' => $totalCharges,
-                    'rto_charge' => 0,
-                    'min_weight' => 0,
-                    'chargeable_weight' => $chargeableWeight,
-                    'applicable_weight' => $chargeableWeight,
-                    'percentage_amount' => 0,
-                    'responseData' => array_merge($rate, [
-                        'courier_name' => $rate['ServiceType'] ?? $rate['serviceType'] ?? $shippingCompany->name,
-                        'shipping_time' => $shippingTime,
-                        'base_freight' => $freightCharges,
-                        'cod_charges' => $codCharges,
-                        'tax' => $tax,
-                        'total_charges' => $totalCharges,
-                        'additional_charges' => 0
-                    ])
-                ];
-            }
-
-            // Handle charges based on B2B/B2C logic
-            foreach ($couriers as &$courier) {
-                if ($weightOrder == 2 && $b2bRateCardId) {
-                    // B2B: Use Other Charges from the Rate Card
-                    if (!empty($otherChargesForB2B)) {
-                        $calc = $this->applyOtherCharges($otherChargesForB2B, (float) $courier['freight_charges'], (float) $courier['chargeable_weight'], (float) ($request->cod_amount ?? 0), $request, true);
-
-                        $b2bCodCharges = 0;
-                        $b2bOverheads = 0;
-                        $filteredDetails = [];
-                        foreach ($calc['details'] as $detail) {
-                            if (!empty($detail['is_info'])) {
-                                $filteredDetails[] = $detail;
-                                continue;
-                            }
-                            if ($this->isCodChargeDetail($detail)) {
-                                $b2bCodCharges += $detail['value'];
-                            } else {
-                                $b2bOverheads += $detail['value'];
-                                $filteredDetails[] = $detail;
-                            }
-                        }
-
-                        $odaAppliedData = $this->applyManagedPincodeOdaChargeToTotals(
-                            (float) $courier['chargeable_weight'],
-                            $managedPincodeMetadata,
-                            [
-                                'overhead_total' => $b2bOverheads,
-                                'overhead_details' => $filteredDetails,
-                            ]
-                        );
-                        $b2bOverheads = (float) ($odaAppliedData['overhead_total'] ?? $b2bOverheads);
-                        $filteredDetails = $odaAppliedData['overhead_details'] ?? $filteredDetails;
-
-                        $commissionAmount = $b2bOverheads;
-                        $courier['cod_charges'] = $b2bCodCharges;
-                        $gstPercent = (float) ($calc['gst_percent'] ?? self::GST_PERCENT);
-                        $overheadDetails = $filteredDetails;
-                    } else {
-                        $commissionAmount = 0;
-                        $gstPercent = self::GST_PERCENT;
-                        $overheadDetails = [];
-                    }
-                } else {
-                    // B2C: keep Routex COD as reported by API and move any local COD add-ons into additional charges.
-                    $apiCodCharges = (float) ($courier['cod_charges'] ?? 0);
-                    $isCodOrder = in_array(strtolower((string) ($request->payment_type ?? '1')), ['cod', '2'], true);
-                    $rateCardChargeData = $this->prepareB2cRateCardCharges($otherChargesForB2C, (float) $courier['freight_charges'], (float) $courier['chargeable_weight'], (float) ($request->cod_amount ?? 0), $request, $managedPincodeMetadata);
-                    $courier['freight_charges'] = $rateCardChargeData['freight'];
-                    $rateCardCodCharges = (float) ($rateCardChargeData['cod_charges'] ?? 0);
-
-                    $commissions = $extraData['commissions'] ?? null;
-                    $commissionData = $this->applyCourierCommission($user, $shippingCompany, $courier['freight_charges'], $courier['courier_id'], $commissions);
-                    $masterCommissionAmount = (float) ($commissionData['master_commission_amount'] ?? 0);
-                    $userCommissionAmount = (float) ($commissionData['user_commission_amount'] ?? 0);
-
-                    $courier['freight_charges'] = round((float) $courier['freight_charges'] + $masterCommissionAmount + $userCommissionAmount, 2);
-                    $courier['cod_charges'] = $apiCodCharges;
-                    $commissionAmount = round(
-                        (float) ($rateCardChargeData['overhead_total'] ?? 0)
-                        + $rateCardCodCharges
-                        + ($isCodOrder ? $userCommissionAmount : 0),
-                        2
-                    );
-                    $gstPercent = $rateCardChargeData['gst_percent'];
-                    $overheadDetails = $rateCardChargeData['overhead_details'];
-
-                    if ($rateCardCodCharges > 0) {
-                        $overheadDetails[] = [
-                            'name' => 'Rate Card COD Charge',
-                            'value' => round($rateCardCodCharges, 2),
-                            'type' => 'flat',
-                        ];
-                    }
-
-                    if ($isCodOrder && $userCommissionAmount > 0) {
-                        $overheadDetails[] = [
-                            'name' => 'User COD Charge',
-                            'value' => round($userCommissionAmount, 2),
-                            'type' => 'flat',
-                        ];
-                    }
-                }
-
-                $courier['percentage_amount'] = $commissionAmount;
-                // Total taxable subtotal (Base + COD + Overheads/Commission)
-                $taxableAmount = $courier['freight_charges'] + $courier['cod_charges'] + $commissionAmount;
-                $newTax = ($taxableAmount * $gstPercent) / 100;
-                $newTotal = round($taxableAmount + $newTax, 2);
-
-                $courier['tax'] = $newTax;
-                $courier['total_charges'] = $newTotal;
-
-                $courier['responseData']['base_freight'] = $courier['freight_charges'];
-                $courier['responseData']['freight_charges'] = $courier['freight_charges'];
-                $courier['responseData']['additional_charges'] = $commissionAmount;
-                $courier['responseData']['cod_charges'] = $courier['cod_charges'];
-                $courier['responseData']['tax'] = $newTax;
-                $courier['responseData']['total_charges'] = $newTotal;
-                $courier['responseData']['percentage_amount'] = $commissionAmount;
-                $courier['responseData']['chargeable_weight'] = $courier['chargeable_weight'];
-                $courier['responseData']['overhead_details'] = $overheadDetails;
-                $courier['responseData']['gst_percent'] = $gstPercent;
-            }
-
-            return $couriers;
-        } catch (\Exception $e) {
-            Log::error('Routx Error: ' . $e->getMessage());
-            return null;
         }
     }
 
@@ -2869,8 +2061,8 @@ class RateCardService
             return $fallbackId;
         }
 
-        // Last resort for priority couriers (1: Shadowfax, 3: Delhivery)
-        if (in_array($companyId, [1, 3])) {
+        // Last resort for the priority courier (1: Shadowfax)
+        if (\App\Models\ShippingCompany::isShadowfaxId($companyId)) {
             return ZoneSetting::where('shipping_company_id', $companyId)
                 ->where('rate_type', 'b2b')
                 ->orderBy('sort_order', 'asc')

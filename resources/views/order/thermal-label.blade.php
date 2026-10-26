@@ -6,309 +6,265 @@
     <title>Shipping Label</title>
 </head>
 @php
-    if (!$preference) {
-        $preference = (object)[
-            'label_size' => 'thermal',
-            'label_sku_limit' => 32,
-            'label_print_limit' => 3,
-            'label_print_multiple' => false,
-            'label_company_logo' => null,
-            'label_show_invoice_value' => false,
-            'label_show_invoice_number' => false,
-            'label_show_weight' => false,
-            'label_show_product_name' => true,
-            'label_show_sku' => true,
-            'label_show_quantity' => true,
-            'label_show_item_price' => true,
-            'label_show_seller_address' => false,
-            'label_show_seller_name' => false,
-            'label_show_seller_mobile' => false,
-            'label_show_company_name' => false,
-        ];
-    }
-    $isThermal = ($preference->label_size ?? 'thermal') == 'thermal';
-    $fontSize = $isThermal ? '10px' : '11px';
-    $padding = $isThermal ? '2px 5px' : '5px';
-    $headerPadding = $isThermal ? '5px' : '10px 10px';
-    $barcodeHeight = $isThermal ? '40px' : '50px';
-    $qrSize = $isThermal ? '50px' : '60px';
-    $prodNameLimit = 30;
-    $skuLimit = $isThermal ? 24 : optional($preference)->label_sku_limit ?? 32;
-    $tablePadding = $isThermal ? '1px 5px' : '5px';
+    // One template for both label sizes (desktop-label includes it). Every "Label Settings"
+    // switch is honoured here; a missing setting row falls back to the defaults below.
+    $defaults = [
+        'label_size' => 'thermal',
+        'label_company_logo' => null,
+        'label_show_invoice_value' => true,
+        'label_show_invoice_number' => true,
+        'label_show_weight' => true,
+        'label_show_cod_amount' => true,
+        'label_show_seller_name' => true,
+        'label_show_company_name' => true,
+        'label_show_seller_address' => true,
+        'label_show_seller_mobile' => true,
+        'label_show_product_name' => true,
+        'label_show_sku' => true,
+        'label_show_quantity' => true,
+        'label_show_item_price' => true,
+        'label_show_taxes' => false,
+        'label_product_name_limit' => 40,
+        'label_sku_limit' => 24,
+        'label_print_multiple' => false,
+        'label_print_limit' => 3,
+    ];
+    $pref = (object) array_merge($defaults, $preference ? array_filter($preference->only(array_keys($defaults)), fn ($v) => $v !== null) : []);
 
-    // Pagination Logic
-    $printLimit = optional($preference)->label_print_limit ?? 3;
-    $doPagination = (optional($preference)->label_print_multiple ?? false) && $products->count() > $printLimit;
+    $isThermal = ($pref->label_size ?? 'thermal') !== 'desktop';
 
-    if ($doPagination) {
-        $chunks = $products->chunk($printLimit);
-    } else {
-        $chunks = [$products];
-    }
+    // Images are embedded as data URIs so the PDF never shows "image not found"
+    $embed = function (array $paths) {
+        foreach ($paths as $path) {
+            if ($path && is_file($path)) {
+                $type = strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'png' ? 'png' : 'jpeg';
+                return 'data:image/' . $type . ';base64,' . base64_encode(file_get_contents($path));
+            }
+        }
+        return null;
+    };
+    $sellerLogo = $pref->label_company_logo ? $embed([
+        storage_path('app/public/settings/label/' . $pref->label_company_logo),
+        public_path('storage/settings/label/' . $pref->label_company_logo),
+    ]) : null;
+    $courierLogo = !empty($shipping->logo) ? $embed([
+        storage_path('app/public/shipping-logo/' . $shipping->logo),
+        public_path('storage/shipping-logo/' . $shipping->logo),
+    ]) : null;
+    $platformLogo = config('setting.header_logo') ? $embed([
+        storage_path('app/public/settings/' . config('setting.header_logo')),
+        public_path('storage/settings/' . config('setting.header_logo')),
+    ]) : null;
 
-    // Pre-calculate addresses to avoid repetition
-    $pickupAddress = '';
-    if ($order->warehouse) {
-        $pickupAddress = trim(
-            $order->warehouse->address .
-                ' ' .
-                $order->warehouse->city .
-                ' ' .
-                $order->warehouse->state .
-                ' ' .
-                $order->warehouse->zip_code .
-                ', ' .
-                $order->warehouse->country,
-        );
+    $warehouse = $order->warehouse;
+    $sellerBrand = $warehouse->company_name ?? (optional($order->user)->company_name ?? '');
+    $pickupAddress = $warehouse
+        ? trim(implode(', ', array_filter([$warehouse->address, $warehouse->city, $warehouse->state, $warehouse->zip_code])))
+        : '';
+    $customerName = trim(($customer->first_name ?? '') . ' ' . ($customer->last_name ?? ''));
+    $customerAddress = trim(implode(', ', array_filter([
+        $customerAddr->address ?? null,
+        $customerAddr->city ?? null,
+        $customerAddr->state ?? null,
+    ])));
+
+    $isCod = strtolower((string) $order->order_type) === 'cod';
+    $money = fn ($v) => 'Rs. ' . number_format((float) $v, 2);
+
+    // Product columns that are switched on; the Total label spans the text columns
+    $showName = (bool) $pref->label_show_product_name;
+    $showSku = (bool) $pref->label_show_sku;
+    $showQty = (bool) $pref->label_show_quantity;
+    $showPrice = (bool) $pref->label_show_item_price;
+    $showItems = $showName || $showSku || $showQty || $showPrice;
+    $itemCols = (int) $showName + (int) $showSku + (int) $showQty + (int) $showPrice;
+    $textCols = (int) $showName + (int) $showSku;
+
+    // Items: the label shows up to "print limit" items. With "Print multiple" on, the rest
+    // continue on the next page(s) (items only, no second barcode); otherwise "+N more".
+    $perPage = max(1, (int) $pref->label_print_limit);
+    $firstItems = $products->take($perPage);
+    $moreItems = $products->slice($perPage)->values();
+    $continuation = (bool) $pref->label_print_multiple && $moreItems->count() ? $moreItems->chunk($perPage)->values() : collect();
+    $hiddenItems = $continuation->count() ? 0 : $moreItems->count();
+    $totalPages = 1 + $continuation->count();
+
+    $showReturn = $pref->label_show_seller_address || $pref->label_show_seller_name
+        || $pref->label_show_company_name || $pref->label_show_seller_mobile;
+
+    // Thermal (4x6 in) should fill its page but never spill onto a second one, so the size tier
+    // follows a rough line count of what is printed. Desktop keeps a compact half-page label.
+    $nameLimit = $isThermal ? min((int) $pref->label_product_name_limit, 50) : (int) $pref->label_product_name_limit;
+    $itemLines = 2; // header + total
+    foreach ($firstItems as $product) {
+        $itemLines += max(1,
+            $showName ? (int) ceil(min(mb_strlen((string) $product->product_name), $nameLimit) / 22) : 1,
+            $showSku ? (int) ceil(min(mb_strlen((string) $product->sku_number), (int) $pref->label_sku_limit) / 14) : 1);
     }
-    $customerAddress =
-        $customerAddr->address .
-        ' ' .
-        $customerAddr->city .
-        ' ' .
-        $customerAddr->state .
-        ' ' .
-        $customerAddr->zip_code .
-        ',' .
-        $customerAddr->country;
+    $itemLines += ($hiddenItems || $continuation->count()) ? 1 : 0;
+    $leftLines = 4 + (int) ceil(min(mb_strlen($customerAddress), 150) / 38);
+    $infoLines = 2 + (int) (bool) $order->platform_order_id + (int) ($pref->label_show_invoice_number && $order->invoice_no)
+        + (int) $pref->label_show_invoice_value + (int) ($pref->label_show_taxes && (float) $order->total_gst_amount > 0)
+        + ($pref->label_show_weight ? 2 : 0);
+    $returnLines = ($showReturn && $warehouse)
+        ? 1 + (int) $pref->label_show_company_name + ($pref->label_show_seller_address ? (int) ceil(mb_strlen($pickupAddress) / 50) : 0)
+            + (int) ($pref->label_show_seller_name || $pref->label_show_seller_mobile)
+        : 0;
+    $density = max($leftLines, $infoLines) + ($showItems ? $itemLines : 0) + $returnLines;
+
+    $tiers = [
+        'large' => ['fs' => 10.5, 'pad' => '5px 6px', 'head' => 54, 'logo' => 46, 'courier' => 30, 'barcode' => 80, 'awb' => 17, 'pin' => 15, 'brand' => 17, 'item' => '4px 5px', 'gap' => 3],
+        'medium' => ['fs' => 9.5, 'pad' => '4px 5px', 'head' => 44, 'logo' => 38, 'courier' => 26, 'barcode' => 60, 'awb' => 15, 'pin' => 13, 'brand' => 15, 'item' => '3px 4px', 'gap' => 2],
+        'compact' => ['fs' => 8.5, 'pad' => '3px 5px', 'head' => 36, 'logo' => 32, 'courier' => 22, 'barcode' => 44, 'awb' => 13, 'pin' => 12, 'brand' => 13, 'item' => '2px 4px', 'gap' => 2],
+    ];
+    $tier = !$isThermal ? 'desktop' : ($density <= 19 ? 'large' : ($density <= 24 ? 'medium' : 'compact'));
+    $s = $tiers[$tier] ?? ['fs' => 10, 'pad' => '3px 5px', 'head' => 44, 'logo' => 42, 'courier' => 26, 'barcode' => 50, 'awb' => 16, 'pin' => 12, 'brand' => 14, 'item' => '2px 4px', 'gap' => 2];
 @endphp
 <style>
-    @page {
-        margin: {{ ($preference->label_size ?? 'thermal') == 'thermal' ? '5px' : '20px' }} !important;
-    }
+    @page { margin: {{ $isThermal ? '6px' : '24px' }}; }
+    body { margin: 0; font-family: Helvetica, Arial, sans-serif; font-size: {{ $s['fs'] }}px; color: #000; }
+    .label { width: {{ $isThermal ? '100%' : '62%' }}; border-collapse: collapse; table-layout: fixed; }
+    .label > tbody > tr > td, .label > tr > td { border: 1px solid #000; padding: {{ $s['pad'] }}; vertical-align: top; }
+    p { margin: 0 0 {{ $s['gap'] }}px; line-height: 1.3; }
+    .b { font-weight: bold; }
+    .muted { color: #333; }
+    .brand { font-size: {{ $s['brand'] }}px; font-weight: bold; }
+    .center { text-align: center; }
+    .items { width: 100%; border-collapse: collapse; }
+    .items th, .items td { padding: {{ $s['item'] }}; border-bottom: 1px solid #000; border-right: 1px solid #000; text-align: left; vertical-align: top; }
+    .items th:last-child, .items td:last-child { border-right: none; }
+    .items tr:last-child td { border-bottom: none; }
+    .awb { font-size: {{ $s['awb'] }}px; font-weight: bold; letter-spacing: 1px; margin: 3px 0 0; }
+    .page-break { page-break-after: always; }
 </style>
 
 <body>
-    @foreach ($chunks as $chunk)
-        <table
-            style="width: {{ $isThermal ? '100%' : '50%' }}; margin: ; border-collapse: collapse; font-family: Arial, sans-serif; font-size: {{ $fontSize }}; border: 1px solid black;">
-            <tr>
-                <td colspan="4"
-                    style="padding: {{ $headerPadding }}; width: 80%; vertical-align: middle; font-size: 25px; font-weight: bold; border: 1px solid black;">
-                @if ($preference->label_company_logo)
-                    <img src="{{ public_path('storage/settings/label/' . $preference->label_company_logo) }}"
-                        width="{{ $isThermal ? '120' : '150' }}" alt="">
+    {{-- ================= Page 1: the shipping label ================= --}}
+    <table class="label">
+        <tr>
+            <td style="width: 66%; vertical-align: middle; height: {{ $s['head'] }}px;">
+                @if ($sellerLogo)
+                    <img src="{{ $sellerLogo }}" style="max-height: {{ $s['logo'] }}px; max-width: 160px;" alt="">
+                @else
+                    <span class="brand">{{ $sellerBrand }}</span>
                 @endif
-                </td>
-                <td colspan="1"
-                    style="padding: 0; text-align: center ; width: 20%; center; border: 1px solid black; padding: 0px 5px;">
-                    <div style="height: {{ $barcodeHeight }}; width: 100%;">
-                        @php
-                            $logoPath = public_path('storage/shipping-logo/' . $shipping->logo);
-                            if (!empty($order->courier_logo)) {
-                                if (filter_var($order->courier_logo, FILTER_VALIDATE_URL)) {
-                                    $logoPath = $order->courier_logo; 
-                                } elseif (file_exists(public_path('storage/courier-logo/' . $order->courier_logo))) {
-                                    $logoPath = public_path('storage/courier-logo/' . $order->courier_logo);
-                                }
-                            }
-                        @endphp
-                        <img src="{{ $logoPath }}" alt="LOGO"
-                            style="max-height: 100%; max-width: 100%; width: auto; height: auto; display: block; margin-left: auto; margin-right: auto;">
-                    </div>
-                    <p style="font-weight: bold; margin-top: 5px; font-size: {{ $fontSize }};">{{ $order->shipping_mode }}</p>
-                </td>
-            </tr>
+            </td>
+            <td class="center" style="width: 34%; vertical-align: middle;">
+                @if ($courierLogo)
+                    <img src="{{ $courierLogo }}" style="max-height: {{ $s['courier'] }}px; max-width: 90px;" alt="">
+                @else
+                    <p class="b">{{ $shipping->name ?? '' }}</p>
+                @endif
+                <p class="b" style="margin: 3px 0 0;">{{ $order->shipping_mode }}</p>
+            </td>
+        </tr>
 
-            <tr>
-                <td colspan="3"
-                    style="padding: {{ $padding }}; font-size: {{ $fontSize }}; border: 1px solid black; vertical-align: top;">
-                    <p style="margin-top: 5px;"> <span style="font-weight: bold;">Deliver To :</span>
-                        {{ $customer->first_name . ' ' . $customer->last_name }}</p>
-
-                    <p style="margin-top: 5px;"><span style="font-weight: bold;">Contact :</span>
-                        {{ $customer->mobile }}</p>
-
-                    <p style="margin-top: 5px;"><span style="font-weight: bold;">Address :</span>
-                        {{ $customerAddress }}
-                    </p>
-                    <p style="margin-top: 5px;"><span style="font-weight: bold;">Pin :</span>
-                        {{ $customerAddr->zip_code }}
-                    </p>
-                    @if ($order->order_type == 'cod')
-                        <p style="margin-top: 5px;"><span style="font-weight: bold;">Payment Type :</span> COD (Rs. {{ $order->cod_amount }})</p>
+        <tr>
+            <td>
+                <p><span class="b">Deliver To:</span> {{ $customerName }}</p>
+                <p><span class="b">Contact:</span> {{ $customer->mobile ?? '' }}</p>
+                <p><span class="b">Address:</span> {{ \Illuminate\Support\Str::limit($customerAddress, $isThermal ? 150 : 260) }}</p>
+                <p><span class="b">PIN:</span> <span class="b" style="font-size: {{ $s['pin'] }}px;">{{ $customerAddr->zip_code ?? '' }}</span></p>
+                <p>
+                    <span class="b">Payment:</span>
+                    @if ($isCod)
+                        <span class="b">COD</span>@if ($pref->label_show_cod_amount) - <span class="b">{{ $money($order->cod_amount) }}</span>@endif
                     @else
-                        <p style="margin-top: 5px;"><span style="font-weight: bold;">Payment Type :</span> Prepaid</p>
+                        Prepaid
                     @endif
-                </td>
+                </p>
+            </td>
+            <td>
+                <p><span class="b">Order:</span> {{ $order->order_prefix }}</p>
+                @if ($order->platform_order_id)
+                    <p><span class="b">{{ ucfirst($order->platform_source ?: 'Channel') }}:</span> {{ $order->platform_order_name ?: $order->platform_order_id }}</p>
+                @endif
+                <p><span class="b">Date:</span> {{ $order->order_date }}</p>
+                @if ($pref->label_show_invoice_number && $order->invoice_no)
+                    <p><span class="b">Inv No:</span> {{ $order->invoice_no }}</p>
+                @endif
+                @if ($pref->label_show_invoice_value)
+                    <p><span class="b">Inv Value:</span> {{ $money($order->total_amount) }}</p>
+                @endif
+                @if ($pref->label_show_taxes && (float) $order->total_gst_amount > 0)
+                    <p><span class="b">GST:</span> {{ $money($order->total_gst_amount) }}</p>
+                @endif
+                @if ($pref->label_show_weight)
+                    <p><span class="b">Weight:</span> {{ (float) $order->weight }} KG</p>
+                    @if ((float) $order->length > 0)
+                        <p class="muted">{{ (float) $order->length }}x{{ (float) $order->width }}x{{ (float) $order->height }} cm</p>
+                    @endif
+                @endif
+            </td>
+        </tr>
 
-                <td colspan="2"
-                    style="padding: {{ $padding }}; font-size: {{ $fontSize }}; border: 1px solid black; vertical-align: top;">
-                    <p style="margin-top: 7px;"><span style="font-weight: bold;">Order Id :</span>
-                        {{ $order->order_prefix }}</p>
-                    @if ($order->invoice_no)
-                        <p style="margin-top: 7px;"><span style="font-weight: bold;">Ref./Invoice# :</span>
-                            {{ $order->invoice_no }}</p>
-                    @endif
-                    <p style="margin-top: 7px;"><span style="font-weight: bold;">Date :</span> {{ $order->order_date }}
-                    </p>
-                    @if ($preference->label_show_invoice_value)
-                        <p style="margin-top: 7px;"><span style="font-weight: bold;">Invoice Value :</span> Rs.
-                            {{ $order->total_amount }}</p>
-                    @endif
-                    @if ($preference->label_show_invoice_number && $order->invoice_no)
-                        <p style="margin-top: 7px;"><span style="font-weight: bold;">Inv No :</span>
-                            {{ $order->invoice_no }}</p>
-                    @endif
-                    @if ($preference->label_show_weight)
-                        <p style="margin-top: 7px;">
-                            <span style="font-weight: bold;">Weights :</span> {{ $order->weight }} KG
-                        </p>
-                    @endif
-
-                    @if ($order->platform_order_id)
-                        <p style="margin-top: 7px;">
-                            <span style="font-weight: bold;">{{ $order->platform_name }} OrderId :</span>
-                            {{ $order->platform_order_id }}
-                        </p>
-                    @endif
-                </td>
-            </tr>
-            @if (
-                $preference->label_show_product_name ||
-                    $preference->label_show_sku ||
-                    $preference->label_show_quantity ||
-                    $preference->label_show_item_price)
-                <tr>
-                    <td colspan="5" style="padding: 0; border: 1px solid black; vertical-align: top;">
-                        <table style="width: 100%; border-collapse: collapse; border: none; font-size: 11px;">
-                            <thead>
-                                <tr>
-                                    {{-- <th
-                                    style="padding: 5px; border-bottom: 1px solid black; border-right: 1px solid black; text-align: left;">
-                                    Product category</th> --}}
-                                    @if (!$preference || $preference->label_show_product_name)
-                                        <th
-                                            style="padding: {{ $padding }}; border-bottom: 1px solid black; border-right: 1px solid black; text-align: left;">
-                                            Product Name</th>
-                                    @endif
-                                    @if (!$preference || $preference->label_show_sku)
-                                        <th
-                                            style="padding: {{ $padding }}; border-bottom: 1px solid black; border-right: 1px solid black; text-align: left;">
-                                            Sku</th>
-                                    @endif
-                                    @if (!$preference || $preference->label_show_quantity)
-                                        <th
-                                            style="padding: {{ $padding }}; width: 70px; border-bottom: 1px solid black; border-right: 1px solid black; text-align: left;">
-                                            Qty</th>
-                                    @endif
-                                    @if (!$preference || $preference->label_show_item_price)
-                                        <th
-                                            style="padding: {{ $padding }}; width: 100px; border-bottom: 1px solid black; text-align: left;">
-                                            Price</th>
-                                    @endif
-                                </tr>
-                            </thead>
-                            <tbody>
-                                @php
-                                    // Total for calculation inside loop should be full order total as requested
-                                    // But sum logic in previous code was summing loop products if no pre-calc.
-                                    // We will calculate TOTALS for the Footer once based on ALL products.
-                                    $grandTotalQuntity = $products->sum('quantity');
-                                    $grandTotalAmount = $order->total_amount;
-                                @endphp
-                                @foreach ($chunk as $product)
-                                    <tr>
-                                        {{-- <td
-                                        style="padding: 5px; border-bottom: 1px solid black; border-right: 1px solid black; vertical-align: top;">
-                                        {{ $product->product_category }}</td> --}}
-                                        @if (!$preference || $preference->label_show_product_name)
-                                            <td
-                                                style="padding: {{ $tablePadding }}; border-bottom: 1px solid black; border-right: 1px solid black; vertical-align: top;">
-                                                {{ \Illuminate\Support\Str::limit($product->product_name, $prodNameLimit) }}
-                                            </td>
-                                        @endif
-                                        @if (!$preference || $preference->label_show_sku)
-                                            <td
-                                                style="padding: {{ $tablePadding }}; border-bottom: 1px solid black; border-right: 1px solid black; vertical-align: top;">
-                                                {{ \Illuminate\Support\Str::limit($product->sku_number, $skuLimit) }}
-                                            </td>
-                                        @endif
-                                        @if (!$preference || $preference->label_show_quantity)
-                                            <td
-                                                style="padding: {{ $tablePadding }}; border-bottom: 1px solid black; border-right: 1px solid black; vertical-align: top;">
-                                                {{ $product->quantity }}
-                                            </td>
-                                        @endif
-                                        @if (!$preference || $preference->label_show_item_price)
-                                            <td
-                                                style="padding: {{ $tablePadding }}; border-bottom: 1px solid black; vertical-align: top;">
-                                                {{ $product->amount }}</td>
-                                        @endif
-                                    </tr>
-                                @endforeach
-                                <tr>
-                                    @if (
-                                        (!$preference->label_show_product_name && !$preference->label_show_sku) ||
-                                            ($preference->label_show_quantity || $preference->label_show_item_price))
-                                        <td colspan="2"
-                                            style="text-align: right; font-weight: bold; padding: {{ $tablePadding }}; border-right: 1px solid black; vertical-align: top;">
-                                            Total
-                                        </td>
-                                    @endif
-                                    @if (!$preference || $preference->label_show_quantity)
-                                        <td
-                                            style="padding: {{ $tablePadding }}; border-right: 1px solid black; vertical-align: top;">
-                                            {{ $grandTotalQuntity }}</td>
-                                    @endif
-                                    @if (!$preference || $preference->label_show_item_price)
-                                        <td style="padding: {{ $tablePadding }}; vertical-align: top;">Rs.
-                                            {{ $grandTotalAmount }}</td>
-                                    @endif
-                                </tr>
-                            </tbody>
-                        </table>
-                    </td>
-                </tr>
-            @endif
-
+        @if ($showItems && $firstItems->count())
             <tr>
-                <td colspan="5"
-                    style="padding: {{ $isThermal ? '5px 0' : '10px 0' }}; text-align: center; border: 1px solid black;">
-                    <div style="height: {{ $barcodeHeight }}; width: 100%;">
-                        @if (!empty($order->shipment_id))
-                            <img src="data:image/png;base64,{{ $orderIdBarcodePng }}" alt="Barcode"
-                                style="display: block; height:{{ $barcodeHeight }}; width:70%; margin: 0 auto;" />
-                        @endif
-                    </div>
-                    <p style="font-size: 18px;margin:0">{{ $order->awb_number }}</p>
+                <td colspan="2" style="padding: 0;">
+                    @include('order.partials.label-items', ['rows' => $firstItems, 'withTotal' => true])
                 </td>
             </tr>
-            @if (
-                $preference->label_show_seller_address ||
-                    $preference->label_show_seller_name ||
-                    $preference->label_show_seller_mobile ||
-                    $preference->label_show_company_name)
-                <tr>
-                    <td colspan="5"
-                        style="padding: {{ $padding }}; border: 1px solid black; vertical-align: top;">
-                        <p style="font-weight: bold; ">If not delivered, Return to:</p>
-                        @if ($preference->label_show_seller_address)
-                            <p>{{ $pickupAddress }}</p>
-                        @endif
-                        @if ($preference->label_show_seller_name)
-                            <p>Contact Name: <span>{{ $order->warehouse->contact_name ?? '' }}</span></p>
-                        @endif
-                        @if ($preference->label_show_company_name)
-                            <p>Company Name: <span>{{ $order->warehouse->company_name ?? '' }}</span></p>
-                        @endif
-                        @if ($preference->label_show_seller_mobile)
-                            <p>Phone: {{ $order->warehouse->contact_number ?? '' }}</p>
-                        @endif
-                    </td>
-                </tr>
-            @endif
-            <tr>
-                <td colspan="5" style="border: 1px solid black; padding: 5px; text-align: right; vertical-align: middle;">
-                    <span style="font-size: 10px; font-weight: bold; vertical-align: middle; font-family: Arial, sans-serif;">Powered by </span>
-                    <img src="{{ public_path('storage/settings/' . config('setting.header_logo')) }}" width="80" alt="ShipFiGO" style="vertical-align: middle;">
-                </td>
-            </tr>
-        </table>
-
-        @if (!$loop->last)
-            <div style="page-break-after: always;"></div>
         @endif
+
+        <tr>
+            <td colspan="2" class="center" style="padding: 6px 5px;">
+                @if (!empty($orderIdBarcodePng))
+                    <img src="data:image/png;base64,{{ $orderIdBarcodePng }}" alt="Barcode"
+                        style="height: {{ $s['barcode'] }}px; width: 86%;">
+                @endif
+                <p class="awb">{{ $order->awb_number }}</p>
+            </td>
+        </tr>
+
+        @if ($showReturn && $warehouse)
+            <tr>
+                <td colspan="2">
+                    <p class="b">If not delivered, return to:</p>
+                    @if ($pref->label_show_company_name && $warehouse->company_name)
+                        <p class="b">{{ $warehouse->company_name }}</p>
+                    @endif
+                    @if ($pref->label_show_seller_address && $pickupAddress)
+                        <p>{{ \Illuminate\Support\Str::limit($pickupAddress, $isThermal ? 140 : 240) }}</p>
+                    @endif
+                    @if ($pref->label_show_seller_name || $pref->label_show_seller_mobile)
+                        <p>
+                            @if ($pref->label_show_seller_name && $warehouse->contact_name)
+                                <span class="b">Contact:</span> {{ $warehouse->contact_name }}
+                            @endif
+                            @if ($pref->label_show_seller_mobile && $warehouse->contact_number)
+                                &nbsp; <span class="b">Ph:</span> {{ $warehouse->contact_number }}
+                            @endif
+                        </p>
+                    @endif
+                </td>
+            </tr>
+        @endif
+
+        @include('order.partials.label-footer', ['pageNo' => 1])
+    </table>
+
+    {{-- ============ "Print multiple": remaining items continue on the next pages ============ --}}
+    @foreach ($continuation as $index => $pageItems)
+        <div class="page-break"></div>
+        <table class="label">
+            <tr>
+                <td style="width: 66%; vertical-align: middle;">
+                    <p class="b" style="font-size: {{ $s['fs'] + 2 }}px;">Order {{ $order->order_prefix }} - items (continued)</p>
+                    <p><span class="b">AWB:</span> {{ $order->awb_number }}</p>
+                    <p><span class="b">Deliver To:</span> {{ $customerName }}, {{ $customerAddr->zip_code ?? '' }}</p>
+                </td>
+                <td class="center" style="width: 34%; vertical-align: middle;">
+                    <p class="b" style="font-size: {{ $s['fs'] + 3 }}px;">Page {{ $index + 2 }} / {{ $totalPages }}</p>
+                </td>
+            </tr>
+            <tr>
+                <td colspan="2" style="padding: 0;">
+                    {{-- Order totals are on page 1 --}}
+                    @include('order.partials.label-items', ['rows' => $pageItems, 'withTotal' => false, 'firstPage' => false])
+                </td>
+            </tr>
+            @include('order.partials.label-footer', ['pageNo' => $index + 2])
+        </table>
     @endforeach
 </body>
 

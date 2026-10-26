@@ -104,6 +104,86 @@ class ShadowfaxService
         return Str::headline(str_replace(['_', '-'], ' ', $value));
     }
 
+    // Shadowfax event code / label => our status_courier (shared by the webhook and the status cron)
+    public const STATUS_MAP = [
+        'delivered' => 'delivered',
+        'new' => 'new',
+        'picked' => 'picked up',
+        'assigned_for_seller_pickup' => 'pending pickup',
+        'assigned_for_pickup' => 'pending pickup',
+        'ofp' => 'out for pickup',
+        'recd_at_rev_hub' => 'picked up',
+        'item_manifested' => 'manifested',
+        'bag_in_transit' => 'in transit',
+        'bag_received' => 'in transit',
+        'bag_received_at_via' => 'in transit',
+        'recd_at_fwd_dc' => 'in transit',
+        'recd_at_fwd_hub' => 'in transit',
+        'assigned_for_delivery' => 'assigned for delivery',
+        'ofd' => 'out for delivery',
+        'nc' => 'not contactable',
+        'na' => 'not attempted',
+        'on_hold' => 'on hold',
+        'pickup_on_hold' => 'pickup on hold',
+        'pickup_not_attempted' => 'pickup not attempted',
+        'cancelled_by_customer' => 'cancelled',
+        'cancelled_by_seller' => 'cancelled',
+        'rts' => 'rto',
+        'rts_in_process' => 'rto in transit',
+        'rts_ofd' => 'rto out for delivery',
+        'rts_d' => 'rto delivered',
+        'rts_nd' => 'rto undelivered',
+        'rto' => 'rto',
+        'rto_in_process' => 'rto in transit',
+        'rto_d' => 'rto delivered',
+        'rto_nd' => 'rto undelivered',
+        'reopen_ndr' => 'reopen ndr',
+        'lost' => 'lost',
+        'out_for_delivery' => 'out for delivery',
+        'out for delivery' => 'out for delivery',
+        'in_transit' => 'in transit',
+        'in transit' => 'in transit',
+        'picked_up' => 'picked up',
+        'picked up' => 'picked up',
+        'rto_initiated' => 'rto',
+        'rto initiated' => 'rto',
+        'rto_delivered' => 'rto delivered',
+        'rto delivered' => 'rto delivered',
+        'cancelled' => 'cancelled',
+    ];
+
+    public static function normalizeStatus(?string $raw): string
+    {
+        $status = strtolower(trim((string) $raw));
+        return self::STATUS_MAP[$status] ?? $status;
+    }
+
+    /**
+     * Current shipment status code from a trackOrder() result: the top-level status when Shadowfax
+     * sends one, else the most recent event of the history. Null when nothing usable came back.
+     */
+    public function currentStatusFromTracking(array $tracking): ?string
+    {
+        $response = is_array($tracking['response'] ?? null) ? $tracking['response'] : [];
+        $current = $this->firstNonEmptyValue($response, ['data.status', 'data.current_status', 'order_details.status', 'current_status', 'event', 'status']);
+        if (is_string($current) && trim($current) !== '' && !in_array(strtolower(trim($current)), ['success', 'ok', 'true', 'false', 'failure', 'error'], true)) {
+            return $current;
+        }
+
+        $history = $tracking['history'] ?? [];
+        if (empty($history)) {
+            return null;
+        }
+        // Event lists may come oldest-first or newest-first: take the latest timestamp
+        usort($history, function ($a, $b) {
+            return strtotime((string) ($b['timestamp'] ?? '')) <=> strtotime((string) ($a['timestamp'] ?? ''));
+        });
+        $latest = $history[0];
+        $code = $latest['status_id'] !== '' ? $latest['status_id'] : $latest['status'];
+
+        return $code !== '' ? $code : null;
+    }
+
     /**
      * Check Pincode Serviceability
      */
@@ -283,7 +363,8 @@ class ShadowfaxService
 
                 // Use the AWB number we generated or the one returned by API
                 $responseAwb = $result['awb_number'] ?? ($result['data']['awb_number'] ?? null);
-                $finalAwb = $responseAwb ?? $awbNumber;
+                // $awbNumber is the generated list; fall back to the AWB we actually sent
+                $finalAwb = $responseAwb ?? ($awbNumber[0] ?? null);
 
                 if ($finalAwb) {
                     return ['success' => true, 'awb_number' => (string) $finalAwb, 'data' => $result];
@@ -346,6 +427,7 @@ class ShadowfaxService
             'date_at',
             'date',
             'scan_date_time',
+            'created', // Shadowfax tracking_details items
         ]) ?? $this->firstNonEmptyValue($scanDetail, ['ScanDateTime']);
 
         $statusLabel = (string) ($status ?: $this->normalizeStatusLabel((string) $statusId));
@@ -405,6 +487,7 @@ class ShadowfaxService
                     'scans',
                     'timeline',
                     'tracking_data',
+                    'tracking_details',
                 ] as $key) {
                     if ($this->looksLikeEventList($root[$key] ?? null)) {
                         $sources[] = $root[$key];
@@ -424,6 +507,7 @@ class ShadowfaxService
             'scans',
             'timeline',
             'tracking_data',
+            'tracking_details', // Shadowfax v4 track response
         ] as $key) {
             if ($this->looksLikeEventList($payload[$key] ?? null)) {
                 $sources[] = $payload[$key];

@@ -20,11 +20,9 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Arr;
-use App\Services\DelhiveryB2CService;
 use App\Services\RateCardService;
 use App\Services\ShipmentProcessor;
 use App\Services\ShadowfaxService;
-use App\Services\UrbaneBoltService;
 use App\Services\WebhookService;
 use App\Support\OrderType;
 use Helper;
@@ -40,16 +38,12 @@ class OrderServiceController extends Controller
     protected $rateCardService;
     protected $shipmentProcessor;
     protected $shadowfaxService;
-    protected $urbaneBoltService;
 
     public function __construct()
     {
         $this->rateCardService = new RateCardService();
         $this->shipmentProcessor = new ShipmentProcessor();
         $this->shadowfaxService = new ShadowfaxService();
-        $this->urbaneBoltService = class_exists(UrbaneBoltService::class)
-            ? new UrbaneBoltService()
-            : null;
     }
 
     /**
@@ -367,59 +361,7 @@ class OrderServiceController extends Controller
             if (!$order) {
                 return $this->errorResponse('Order not found');
             }
-            $shippingCompany =  $order->shippingCompany;
             $trackingHistories = [];
-            $expectedDeliveryDate = "N/A";
-            if (!empty($order->awb_number)) {
-                if ($shippingCompany->id == 1) {
-                    $delhiveryB2CService = new DelhiveryB2CService();
-                    $trackingResponse = $delhiveryB2CService->trackOrderByAwbNumber($order->awb_number, $shippingCompany);
-
-                    if ($trackingResponse['success'] && $trackingResponse['response']['ShipmentData']) {
-                        $responseData = $trackingResponse['response']['ShipmentData'][0]['Shipment']['Scans'] ?? [];
-
-                        $status = $trackingResponse['response']['ShipmentData'][0]['Shipment']['Status']['Status'] ?? null;
-                        $history = collect(array_reverse($responseData))->map(function ($value) {
-                            return [
-                                'status_code' => $value['ScanDetail']['ScanType'],
-                                'location' => $value['ScanDetail']['ScannedLocation'],
-                                'event_time' => date('Y-m-d H:i:s', strtotime($value['ScanDetail']['StatusDateTime'])),
-                                'message' => $value['ScanDetail']['Instructions'],
-                            ];
-                        });
-                        $expectedDeliveryDate = $trackingResponse['response']['ShipmentData'][0]['Shipment']['ExpectedDeliveryDate'] ?
-                            date('Y-m-d h:i A', strtotime($trackingResponse['response']['ShipmentData'][0]['Shipment']['ExpectedDeliveryDate'])) :
-                            'N/A';
-                        $trackingHistories = $this->commonData($order, $status, $history, $expectedDeliveryDate);
-                    }
-                } elseif ($shippingCompany->id == 2) {
-                    $shipMozo = app(\App\Services\ShipMozo::class);
-                    $trackingResponse = $shipMozo->trackOrder($order->awb_number, $shippingCompany);
-
-                    if ($trackingResponse['success'] ?? false) {
-                        $resp = $trackingResponse['response'];
-                        $scans = [];
-                        if (isset($resp['data']) && is_array($resp['data'])) {
-                            $scans = $resp['data']['scans'] ?? ($resp['data']['history'] ?? []);
-                            $expectedDeliveryDate = $resp['data']['edd'] ?? ($resp['data']['expected_delivery_date'] ?? 'N/A');
-                        } else {
-                            $scans = $resp['scans'] ?? ($resp['history'] ?? []);
-                            $expectedDeliveryDate = $resp['expected_delivery_date'] ?? ($resp['edd'] ?? 'N/A');
-                        }
-
-                        $history = collect($scans)->map(function ($value) {
-                            return [
-                                'status_code' => $value['status_name'] ?? ($value['activity'] ?? ($value['status'] ?? 'N/A')),
-                                'location' => $value['location_name'] ?? ($value['location'] ?? ''),
-                                'event_time' => date('Y-m-d H:i:s', strtotime($value['date_at'] ?? ($value['created_at'] ?? now()))),
-                                'message' => $value['remarks'] ?? ($value['reason'] ?? ''),
-                            ];
-                        });
-
-                        $trackingHistories = $this->commonData($order, $order->status_courier, $history, $expectedDeliveryDate);
-                    }
-                }
-            }
             return $this->successResponse([
                 'trackingHistories' => $trackingHistories,
             ]);
@@ -744,7 +686,7 @@ class OrderServiceController extends Controller
     private function buildCourierQuotes($order, $user): array
     {
         $couriers = [];
-        foreach (ShippingCompany::whereStatus(1)->get() as $shippingCompany) {
+        foreach (ShippingCompany::availableFor($user) as $shippingCompany) {
             $rateRequest = new Request();
             $rateRequest->merge([
                 'volumdata' => [[
@@ -812,8 +754,7 @@ class OrderServiceController extends Controller
             ->map(function ($courier) {
                 $clean = Arr::except($courier, self::INTERNAL_COURIER_FIELDS);
                 // Always expose courier_id so the caller knows what to post to /order/ship.
-                // Direct couriers (Shadowfax, Delhivery B2C) have none → null; aggregator
-                // couriers carry the real sub-courier id.
+                // Direct couriers (Shadowfax) have none → null.
                 $clean['courier_id'] = $courier['courier_id'] ?? null;
                 return $clean;
             })
@@ -1075,7 +1016,7 @@ class OrderServiceController extends Controller
             }
 
             $orderCancelledData = [];
-            if ($shippingCompany->id == 1) {
+            if ($shippingCompany->isShadowfax()) {
                 $response = $this->shadowfaxService->cancel(
                     $order->awb_number,
                     $shippingCompany,
@@ -1092,22 +1033,6 @@ class OrderServiceController extends Controller
                     'status_courier' => $isQueuedCancellation ? 'cancel requested' : 'cancelled',
                     'order_cancel_date' => now(),
                     'reason_cancel' => $response['message'] ?? "Shipment cancelled in Shadowfax for AWB: {$order->awb_number}.",
-                ];
-            } elseif ($shippingCompany->id == 2) {
-                if (!$this->urbaneBoltService) {
-                    return $this->errorResponse('UrbaneBolt service is not configured.');
-                }
-
-                $response = $this->urbaneBoltService->cancelShipmentByAwbNo($order->awb_number, $shippingCompany);
-
-                if (!($response['success'] ?? false)) {
-                    return $this->errorResponse($response['response']['message'] ?? 'An error occurred during cancellation.');
-                }
-
-                $orderCancelledData = [
-                    'status_courier' => 'cancelled',
-                    'order_cancel_date' => now(),
-                    'reason_cancel' => "For AWB number {$order->awb_number}, Shipment has been cancelled.",
                 ];
             }
 
@@ -1215,31 +1140,6 @@ class OrderServiceController extends Controller
         $orderActivities = OrderActivity::where('order_id', $order_id)->latest()->get();
 
         $trackingHistories = [];
-        if (!empty($order->awb_number)) {
-            $shippingCompany = $order->shippingCompany ?? null;
-
-            if (($shippingCompany && $shippingCompany->id == 1)) {
-                $b2cService = new DelhiveryB2CService();
-                $trackingResponse = $b2cService->trackOrderByAwbNumber($order->awb_number, $shippingCompany);
-
-                if ((isset($trackingResponse['response']['ShipmentData']) && !empty($trackingResponse['response']['ShipmentData']))) {
-                    $responseData = $trackingResponse['response']['ShipmentData'][0]['Shipment']['Scans'] ?? [];
-                    $trackingHistories = array_reverse($responseData);
-                }
-            } elseif (($shippingCompany && $shippingCompany->id == 2)) {
-                $shipMozo = app(\App\Services\ShipMozo::class);
-                $trackingResponse = $shipMozo->trackOrder($order->awb_number, $shippingCompany);
-
-                if ($trackingResponse['success'] ?? false) {
-                    $resp = $trackingResponse['response'];
-                    if (isset($resp['data']) && is_array($resp['data'])) {
-                        $trackingHistories = $resp['data']['scans'] ?? ($resp['data']['history'] ?? []);
-                    } else {
-                        $trackingHistories = $resp['scans'] ?? ($resp['history'] ?? []);
-                    }
-                }
-            }
-        }
         return $this->successResponse(compact('order', 'orderActivities', 'trackingHistories'), 'success');
     }
 }

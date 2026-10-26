@@ -90,6 +90,7 @@ class Order extends Model
 		'total_gst_amount',
 		'total_shipping_cost',
 		'queue',
+		'cancel_on_channel', // cancel on Shopify once a queued courier cancellation is confirmed
 		'confirm_shopify_order',
 		'send_whatsapp_notify',
 		'shopify_order_name',

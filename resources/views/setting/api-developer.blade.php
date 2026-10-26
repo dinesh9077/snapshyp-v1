@@ -332,7 +332,7 @@ code { font-family: 'Courier New', monospace; }
         <p style="margin:2px 0 8px;color:#999;font-size:13px;">
             Returns every serviceable courier for the order with its chargeable weight and total charge. Pick one and post it back to <code>/order/ship</code>.
             Package dimensions and warehouse must be set first. Note: <code>courier_id</code> is <code>null</code> for
-            direct couriers (Shadowfax, Delhivery B2C) and carries a real id only for aggregator sub-couriers — send it back exactly as returned.
+            direct couriers (Shadowfax) — send it back exactly as returned.
         </p>
         <pre id="curl4"><code>curl --location '{{ url('/api-service/order/courier-list/123') }}' \
   --header 'X-API-Token: {{ $apiToken }}'</code></pre>
@@ -350,9 +350,9 @@ code { font-family: 'Courier New', monospace; }
   --header 'Content-Type: application/json' \
   --data '{
     "order_id": 123,
-    "shipping_company_id": 3,
-    "courier_id": 39,
-    "courier_name": "SR - Delhivery Surface 5kg",
+    "shipping_company_id": 1,
+    "courier_id": null,
+    "courier_name": "Shadowfax",
     "total_charges": 213.46,
     "applicable_weight": 5
   }'</code></pre>

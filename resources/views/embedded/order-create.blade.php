@@ -56,6 +56,18 @@
             color: #ffffff;
             text-decoration: none;
         }
+
+        /* Live bulk-ship progress (same states as the web panel) */
+        .bp-stats { display: flex; flex-wrap: wrap; gap: 6px; }
+        .bp-stat { border: 1px solid #e3e7ef; background: #f7f9fc; border-radius: 999px; padding: 3px 10px; font-size: 13px; font-weight: 600; color: #4a5763; }
+        .bp-list { border: 1px solid #e3e7ef; border-radius: 8px; max-height: 300px; overflow-y: auto; text-align: left; }
+        .bp-row { display: flex; gap: 10px; padding: 7px 12px; border-bottom: 1px solid #f0f2f6; font-size: 13px; }
+        .bp-row:last-child { border-bottom: 0; }
+        .bp-row .bp-num { font-weight: 600; min-width: 64px; }
+        .bp-row .bp-msg { color: #4a5763; flex: 1; overflow-wrap: anywhere; }
+        .bp-row.st-success .bp-ico { color: #1f9d55; }
+        .bp-row.st-failed .bp-ico, .bp-row.st-failed .bp-msg { color: #d64545; }
+        .bp-row.st-skipped { opacity: .7; }
     </style>
 </head>
 
@@ -140,9 +152,10 @@
                         <select class="form-control" id="courier_shipment_id" name="courier_shipment_id">
                             <option value="">Select Courier</option>
                             @foreach ($shipments as $shipment)
-                                <option value="{{ $shipment->id }}">{{ $shipment->name }}</option>
+                                <option value="{{ $shipment->id }}" data-name="{{ $shipment->name }}">{{ $shipment->name }}</option>
                             @endforeach
                         </select>
+                        <small class="text-muted d-block mt-1" id="courierQuoteNote"></small>
                         <small class="text-danger error-msg" id="courierError"></small>
                     </div>
 
@@ -168,6 +181,157 @@
         const userId = @json($userId);
         const loginUrl = "{{ url('login') }}";
         const companyName = "{{ config('setting.company_name') }}";
+        const quoteUrl = "{{ route('shopify.bulk-shipment.quote') }}";
+        const statusBase = "{{ url('shopify/bulk-shipment/status') }}";
+        const retryBase = "{{ url('shopify/bulk-shipment/retry') }}";
+
+        // shop / host must ride along on every call (ShopifyEmbeddedAuth needs them)
+        function withShop(url, extra = {}) {
+            const params = new URLSearchParams(window.location.search);
+            const query = new URLSearchParams(extra);
+            ['shop', 'host'].forEach(k => { if (params.get(k)) query.set(k, params.get(k)); });
+            return url + (url.includes('?') ? '&' : '?') + query.toString();
+        }
+
+        function ordersListUrl() {
+            return withShop("{{ route('shopify.orders.list.page') }}");
+        }
+
+        const esc = s => String(s ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+        const money = n => '₹' + Number(n || 0).toFixed(2);
+
+        // ---- Courier price, like Ship Now on the web panel ------------------------
+        let quoteRequestNo = 0;
+
+        function loadQuotes() {
+            const requestNo = ++quoteRequestNo; // a slower, older answer must not overwrite a newer one
+            const warehouseId = $('#warehouse_id').val();
+            const $options = $('#courier_shipment_id option[value!=""]');
+            $options.each(function() { $(this).text($(this).data('name')); });
+            $('#courierQuoteNote').text('');
+            if (!warehouseId) return;
+
+            $('#courierQuoteNote').text('Checking shipping charges…');
+            $.ajax({
+                url: withShop(quoteUrl, { order_ids: orderIds.join(','), warehouse_id: warehouseId }),
+                dataType: 'json',
+            }).done(function(res) {
+                if (requestNo !== quoteRequestNo) return;
+                const notes = [];
+                (res.couriers || []).forEach(function(c) {
+                    const $opt = $('#courier_shipment_id option[value="' + c.id + '"]');
+                    if (!c.priced) {
+                        $opt.text(c.name + ' — no rate');
+                    } else if (c.orders === 1) {
+                        $opt.text(c.name + ' — ' + money(c.total));
+                    } else {
+                        $opt.text(c.name + ' — ' + money(c.total) + ' for ' + c.priced + ' of ' + c.orders + ' orders');
+                    }
+                    if (c.missing.length) {
+                        notes.push(c.name + ': no rate for ' + c.missing.slice(0, 5).join(', ') + (c.missing.length > 5 ? '…' : '') +
+                            ' (check weight, pincode serviceability and rate card)');
+                    }
+                });
+                $('#courierQuoteNote').text(notes.join(' · ') || 'Charges include GST. Final amount is confirmed at booking.');
+            }).fail(function() {
+                if (requestNo !== quoteRequestNo) return;
+                $('#courierQuoteNote').text('Could not load shipping charges.');
+            });
+        }
+
+        $(function() {
+            const $warehouse = $('#warehouse_id');
+            if (!$warehouse.val() && $warehouse.find('option[value!=""]').length === 1) {
+                $warehouse.val($warehouse.find('option[value!=""]').val());
+            }
+            $warehouse.on('change', loadQuotes);
+            loadQuotes();
+        });
+
+        // ---- Live progress after submit, same states as the web panel -------------
+        const bp = { id: null, timer: null, errors: 0, startedAt: 0 };
+
+        function showProgress(batchId) {
+            clearTimeout(bp.timer);
+            Object.assign(bp, { id: batchId, errors: 0, startedAt: Date.now() });
+            $('#shipmentBulkForm').closest('.card-body').html(`
+                <h5 class="card-title text-center mb-1" id="bpTitle">Shipping orders…</h5>
+                <p class="text-center text-muted small mb-3" id="bpSubtitle">Waiting for the queue to pick up your orders…</p>
+                <div class="d-flex justify-content-between small mb-1"><span id="bpCounts"></span><b id="bpFraction">0 / 0</b></div>
+                <div class="progress mb-3" style="height: 10px;">
+                    <div class="progress-bar bg-success" id="bpBarOk" style="width: 0%"></div>
+                    <div class="progress-bar bg-danger" id="bpBarFail" style="width: 0%"></div>
+                </div>
+                <div class="alert alert-warning small py-2 d-none" id="bpStalled">
+                    No order has started yet. Your orders stay queued and are booked as soon as the queue runs.
+                </div>
+                <div class="bp-list mb-3" id="bpList"><div class="text-muted small text-center py-3">Loading…</div></div>
+                <div class="d-flex gap-2 justify-content-center flex-wrap">
+                    <button type="button" class="btn btn-outline-danger d-none" id="bpRetry">Retry failed (<span id="bpRetryCount">0</span>)</button>
+                    <a href="${ordersListUrl()}" class="btn-orders mt-0">📋 Back to Orders List</a>
+                </div>
+            `);
+            tick();
+        }
+
+        function tick() {
+            $.ajax({ url: withShop(statusBase + '/' + encodeURIComponent(bp.id)), dataType: 'json', cache: false })
+                .done(function(b) {
+                    bp.errors = 0;
+                    render(b);
+                    if (b.status !== 'done') {
+                        bp.timer = setTimeout(tick, ((b.total || 0) <= 20 || Date.now() - bp.startedAt < 30000) ? 1500 : 3000);
+                    }
+                })
+                .fail(function() {
+                    bp.errors++;
+                    bp.timer = setTimeout(tick, Math.min(10000, 2000 * bp.errors));
+                });
+        }
+
+        function render(b) {
+            const total = b.total || 0, ok = b.success || 0, fail = b.failed || 0, skip = b.skipped || 0;
+            const done = ok + fail, proc = Math.max(0, total - done);
+            const pct = n => (total ? (n / total * 100) : 0).toFixed(1) + '%';
+            const finished = b.status === 'done';
+
+            $('#bpTitle').text(finished ? (fail ? '⚠️ Bulk shipping complete' : '✅ Bulk shipping complete') : 'Shipping orders…');
+            $('#bpSubtitle').text(finished
+                ? ok + ' shipped, ' + fail + ' failed' + (skip ? ', ' + skip + ' skipped' : '') + '.'
+                : (b.started ? 'Booking with the courier — you can leave this page, booking continues in the background.' : 'Waiting for the queue to pick up your orders…'));
+            $('#bpFraction').text(done + ' / ' + total);
+            $('#bpCounts').html('✅ ' + ok + ' shipped · ❌ ' + fail + ' failed' + (proc ? ' · ⏳ ' + proc + ' in queue' : '') + (skip ? ' · ⏭ ' + skip + ' skipped' : ''));
+            $('#bpBarOk').css('width', pct(ok));
+            $('#bpBarFail').css('width', pct(fail));
+            $('#bpStalled').toggleClass('d-none', !b.stalled);
+
+            $('#bpList').html((b.items || []).map(function(it) {
+                let ico, msg;
+                switch (it.status) {
+                    case 'queued': ico = '🕒'; msg = 'Queued'; break;
+                    case 'processing': ico = '⏳'; msg = 'Booking with the courier…'; break;
+                    case 'success': ico = '✔'; msg = 'Shipped' + (it.awb ? ' · AWB <b>' + esc(it.awb) + '</b>' : '') + (it.courier ? ' · ' + esc(it.courier) : ''); break;
+                    case 'failed': ico = '✖'; msg = esc(it.error || 'Shipment failed'); break;
+                    default: ico = '⏭'; msg = 'Skipped — ' + esc(it.error || 'not eligible');
+                }
+                return '<div class="bp-row st-' + esc(it.status) + '"><span class="bp-ico">' + ico + '</span>' +
+                    '<span class="bp-num">#' + esc(String(it.order_id).padStart(5, '0')) + '</span><span class="bp-msg">' + msg + '</span></div>';
+            }).join('') || '<div class="text-muted small text-center py-3">Nothing here.</div>');
+
+            const retryable = (b.items || []).filter(it => it.status === 'failed').length;
+            $('#bpRetryCount').text(retryable);
+            $('#bpRetry').toggleClass('d-none', !(finished && retryable));
+        }
+
+        $(document).on('click', '#bpRetry', function() {
+            const $btn = $(this).prop('disabled', true);
+            $.ajax({ url: withShop(retryBase + '/' + encodeURIComponent(bp.id)), type: 'POST', dataType: 'json', data: { _token: "{{ csrf_token() }}" } })
+                .done(function(res) {
+                    if (res.batch_id) showProgress(res.batch_id);
+                    else { $btn.prop('disabled', false); alert(res.msg || 'No failed orders can be retried.'); }
+                })
+                .fail(function() { $btn.prop('disabled', false); alert('Could not retry the failed orders. Please try again.'); });
+        });
 
         // Handle back button click
         $(document).ready(function() {
@@ -316,7 +480,9 @@
                 success: function(res) {
                     stopLoading($submitButton);
 
-                    if (res.status === "success") {
+                    if (res.status === "success" && res.batch_id) {
+                        showProgress(res.batch_id);
+                    } else if (res.status === "success") {
                         const urlParams = new URLSearchParams(window.location.search);
                         const shop = urlParams.get('shop');
                         const host = urlParams.get('host');
@@ -328,7 +494,7 @@
 
                         let resultHtml = `
                         <div class="text-center py-5">
-                            <h4 class="text-success mb-3">✅ Bulk Shipment Completed</h4>
+                            <h4 class="text-success mb-3">✅ Bulk Shipment Queued</h4>
                             <p class="fw-bold">${res.msg}</p>
                             <p class="text-muted">Check executed orders in <a href="${loginUrl}" target="_blank">${companyName} Panel</a>.</p>
                             <a href="${ordersListUrl}" class="btn-orders">📋 Back to Orders List</a>

@@ -10,7 +10,6 @@ use App\Models\ShippingCompany;
 use App\Models\PickupRequest;
 use App\Models\CourierWarehouse;
 use DB, Auth, File, Helper;
-use App\Services\{DelhiveryB2CService, ShipMozo, DelhiveryService, RoutxService};
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
 use DateTime, DateInterval, DatePeriod;
@@ -19,17 +18,9 @@ use Carbon\Carbon;
 
 class WarehouseController extends Controller
 {
-	protected $delhiveryService;
-    protected $delhiveryB2CService;
-	protected $shipMozo;
-	protected $routxService;
 	public function __construct()
 	{
 		$this->middleware('auth');
-		$this->delhiveryB2CService = new DelhiveryB2CService();
-		$this->delhiveryService = new DelhiveryService();
-		$this->shipMozo = new ShipMozo();
-		$this->routxService = new RoutxService();
 	}
 
 	public function index()
@@ -178,97 +169,12 @@ class WarehouseController extends Controller
 		try {
 
 			$courierWarehouse = CourierWarehouse::create($warehouseData);
-			$shippingCompanies = ShippingCompany::where('id', 1)->where('status', 1)->get();
-			$this->addWareHouseByAPI($courierWarehouse, $shippingCompanies);
 
 			DB::commit();
 			return response()->json(['status' => 'success', 'msg' => 'The warehouse has been successfully added.', 'warehouse_id' => $courierWarehouse->id]);
 		} catch (\Exception $e) {
 			DB::rollBack();
 			return response()->json(['status' => 'error', 'msg' => 'Failed to add warehouse. Please try again. ' . $e->getMessage()]);
-		}
-	}
-
-	public function addWareHouseByAPI($courierWarehouse, $shippingCompanies)
-	{
-		if ($shippingCompanies->isNotEmpty()) {
-			foreach ($shippingCompanies as $shippingCompany) {
-				if ((int) $shippingCompany->id === 1) {
-					$data = $this->routxService->createWarehouse($courierWarehouse, $shippingCompany);
-					if (!empty($data['success'])) {
-						$existingCreated = $courierWarehouse->created ?? [];
-						if (is_string($existingCreated)) {
-							$existingCreated = json_decode($existingCreated, true) ?? [];
-						}
-						$existingCreated['routx_status'] = 1;
-
-						$courierWarehouse->created = $existingCreated;
-						$courierWarehouse->shipping_id = $shippingCompany->id;
-						$courierWarehouse->api_response = $data['response'];
-						$courierWarehouse->save();
-					}
-				} elseif (in_array($shippingCompany->id, [3, 4])) {
-					$data = $this->delhiveryB2CService->createWarehouse($courierWarehouse, $shippingCompany);
-
-					if (!isset($data['success']) || !$data['success']) {
-						continue;
-					}
-
-					// Delhivery B2C might return success as a string "True" or boolean true
-					$responseSuccess = $data['response']['success'] ?? false;
-					if ($responseSuccess === true || $responseSuccess === "True" || $responseSuccess === 1 || $responseSuccess === "1")
-					{
-						$existingCreated = $courierWarehouse->created ?? [];
-						if (is_string($existingCreated)) {
-							$existingCreated = json_decode($existingCreated, true) ?? [];
-						}
-						$existingCreated['delhivery_status'] = 1;
-
-						$courierWarehouse->created = $existingCreated;
-						$courierWarehouse->shipping_id = $shippingCompany->id;
-						$courierWarehouse->api_response = $data['response'];
-						$courierWarehouse->save();
-					}
-				} elseif ($shippingCompany->id == 2) {
-					$data = $this->shipMozo->createWarehouse($courierWarehouse, $shippingCompany);
-
-					if (!empty($data['success']) || (isset($data['response']['result']) && $data['response']['result'] == 1)) {
-						$existingCreated = $courierWarehouse->created ?? [];
-						if (is_string($existingCreated)) {
-							$existingCreated = json_decode($existingCreated, true) ?? [];
-						}
-						$existingCreated['ship_mozo'] = 1;
-						$existingCreated['shipMozo'] = 1;
-
-						$courierWarehouse->created = $existingCreated;
-						$courierWarehouse->shipmozo_warehouse_id = $data['response']['data']['warehouse_id'] ?? $courierWarehouse->shipmozo_warehouse_id;
-						$courierWarehouse->shipping_id = $data['response']['data']['warehouse_id'] ?? $courierWarehouse->shipping_id;
-						$courierWarehouse->api_response = $data['response'];
-						$courierWarehouse->save();
-					}
-				} elseif ($shippingCompany->id == 5) {
-					$data = $this->delhiveryService->createWarehouse($courierWarehouse, $shippingCompany);
-
-					if (!isset($data['success']) || !$data['success']) {
-						continue;
-					}
-
-					$responseSuccess = $data['response']['success'] ?? false;
-					if ($responseSuccess === true || $responseSuccess === "True" || $responseSuccess === 1 || $responseSuccess === "1" || (isset($data['response']['name']) && !empty($data['response']['name'])))
-					{
-						$existingCreated = $courierWarehouse->created ?? [];
-						if (is_string($existingCreated)) {
-							$existingCreated = json_decode($existingCreated, true) ?? [];
-						}
-						$existingCreated['delhivery_b2b_status'] = 1;
-
-						$courierWarehouse->created = $existingCreated;
-						$courierWarehouse->shipping_id = $shippingCompany->id;
-						$courierWarehouse->api_response = $data['response'];
-						$courierWarehouse->save();
-					}
-				}
-			}
 		}
 	}
 
@@ -315,86 +221,14 @@ class WarehouseController extends Controller
 			$courierWarehouse->label_options = $labelOptions;
 			$courierWarehouse->updated_at = $timestamp;
 
-			// Check if warehouse name or address has changed
-			$shouldUpdateAPI = $courierWarehouse->isDirty(['address', 'contact_number', 'contact_name', 'contact_email', 'company_name']);
-
 			// Save updates
 			$courierWarehouse->save();
-
-			// If name or address changed, update via API
-			if ($shouldUpdateAPI) {
-				$shippingCompanies = ShippingCompany::where('id', 1)->where('status', 1)->get();
-				$this->updateWareHouseByAPI($courierWarehouse, $shippingCompanies);
-			}
 
 			DB::commit();
 			return response()->json(['status' => 'success', 'msg' => 'The warehouse has been successfully updated.']);
 		} catch (\Exception $e) {
 			DB::rollBack();
 			return response()->json(['status' => 'error', 'msg' => 'Failed to update warehouse. Please try again. ' . $e->getMessage()]);
-		}
-	}
-
-	public function updateWareHouseByAPI($courierWarehouse, $shippingCompanies)
-	{
-		if ($shippingCompanies->isNotEmpty()) {
-			foreach ($shippingCompanies as $shippingCompany) {
-				if ((int) $shippingCompany->id === 1) {
-					$data = $this->routxService->createWarehouse($courierWarehouse, $shippingCompany);
-					if (!empty($data['success'])) {
-						$existingCreated = $courierWarehouse->created ?? [];
-						if (is_string($existingCreated)) {
-							$existingCreated = json_decode($existingCreated, true) ?? [];
-						}
-						$existingCreated['routx_status'] = 1;
-
-						$courierWarehouse->created = $existingCreated;
-						$courierWarehouse->shipping_id = $shippingCompany->id;
-						$courierWarehouse->api_response = $data['response'];
-						$courierWarehouse->save();
-					}
-				} elseif (in_array($shippingCompany->id, [3, 4])) {
-					$data = $this->delhiveryB2CService->updateWarehouse($courierWarehouse, $shippingCompany);
-					if (!isset($data['success']) || !$data['success']) {
-						continue;
-					}
-
-					$responseSuccess = $data['response']['success'] ?? false;
-					if ($responseSuccess === true || $responseSuccess === "True" || $responseSuccess === 1 || $responseSuccess === "1") {
-
-						$existingCreated = $courierWarehouse->created ?? [];
-						if (is_string($existingCreated)) {
-							$existingCreated = json_decode($existingCreated, true) ?? [];
-						}
-						$existingCreated['delhivery_status'] = 1;
-
-						$courierWarehouse->created = $existingCreated;
-						$courierWarehouse->shipping_id   = $shippingCompany->id;
-						$courierWarehouse->api_response  = $data['response'];
-						$courierWarehouse->save();
-					}
-				} elseif ($shippingCompany->id == 5) {
-					$data = $this->delhiveryService->updateWarehouse($courierWarehouse, $shippingCompany);
-					if (!isset($data['success']) || !$data['success']) {
-						continue;
-					}
-
-					$responseSuccess = $data['response']['success'] ?? false;
-					if ($responseSuccess === true || $responseSuccess === "True" || $responseSuccess === 1 || $responseSuccess === "1" || (isset($data['response']['name']) && !empty($data['response']['name']))) {
-
-						$existingCreated = $courierWarehouse->created ?? [];
-						if (is_string($existingCreated)) {
-							$existingCreated = json_decode($existingCreated, true) ?? [];
-						}
-						$existingCreated['delhivery_b2b_status'] = 1;
-
-						$courierWarehouse->created = $existingCreated;
-						$courierWarehouse->shipping_id   = $shippingCompany->id;
-						$courierWarehouse->api_response  = $data['response'];
-						$courierWarehouse->save();
-					}
-				}
-			}
 		}
 	}
 
@@ -422,7 +256,7 @@ class WarehouseController extends Controller
 			->where('warehouse_status', 1)
 			->get();
 
-		$shippingCompanies = ShippingCompany::whereIn('id', [1])
+		$shippingCompanies = ShippingCompany::where('provider', 'shadowfax')
 			->where('status', 1)
 			->get(['id', 'name']);
 
@@ -560,143 +394,18 @@ class WarehouseController extends Controller
 
 	public function createPickupRequest(Request $request)
 	{
-		DB::beginTransaction();
+		// Validate if the shipping company exists
+		$shippingCompany = ShippingCompany::where('status', 1)->where('id', $request->shipping_company_id)->first();
 
-		try {
-			// Validate if the shipping company exists
-			$shippingCompany = ShippingCompany::where('status', 1)->where('id', $request->shipping_company_id)->first();
-
-			if (!$shippingCompany) {
-				if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => 'Shipping company not found or inactive.']);
-				return redirect()->back()->with('error', 'Shipping company not found or inactive.');
-			}
-
-			// Preparation for bulk pickup if order_ids are provided
-			$requestedData = $request->except('_token');
-			if ($request->filled('order_ids')) {
-				$orderIds = explode(',', $request->order_ids);
-				if (!isset($requestedData['expected_package_count'])) {
-					$requestedData['expected_package_count'] = count($orderIds);
-				}
-			}
-
-			if ((int) $shippingCompany->id === 3 || (int) $shippingCompany->id === 4) {
-				// Call the external service to create a pickup request
-				$data = $this->delhiveryB2CService->createPickupRequest($requestedData, $shippingCompany);
-
-				// Handle API response errors
-				if (!($data['success'] ?? false)) {
-					$errorMsg = ($data['response']['pickup_location']
-						?? $data['response']['pickup_date']
-						?? $data['response']['prepaid']
-						?? null)
-						?? ($data['response']['error']['message'] ?? ($data['response']['detail'] ?? 'An error occurred.'));
-					if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => $errorMsg]);
-					return redirect()->back()->with('error', $errorMsg);
-				}
-
-				// Extract response data
-				$responseData = $data['response'] ?? null;
-				if (isset($responseData['error'])) {
-					$errorMsg = is_array($responseData['error']) ? ($responseData['error']['message'] ?? 'An error occurred.') : $responseData['error'];
-					if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => $errorMsg]);
-					return redirect()->back()->with('error', $errorMsg);
-				}
-
-				if (!$responseData || empty($responseData['pickup_id'])) {
-					$errorMsg = $responseData['detail'] ?? ($responseData['message'] ?? 'Pickup ID not received from the API.');
-					if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => $errorMsg]);
-					return redirect()->back()->with('error', $errorMsg);
-				}
-			} elseif ($shippingCompany->id == 2) {
-				// ShipMozo Pickup Request
-				$data = $this->shipMozo->createPickupRequest($requestedData, $shippingCompany);
-
-				if (!($data['success'] ?? false)) {
-					$errorMsg = $data['response']['error'] ?? ($data['response']['message'] ?? 'An error occurred with ShipMozo pickup.');
-					if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => $errorMsg]);
-					return redirect()->back()->with('error', $errorMsg);
-				}
-
-				$responseData = $data['response'] ?? null;
-				if (!$responseData || empty($responseData['pickup_id'])) {
-					$errorMsg = 'Pickup ID not received from ShipMozo.';
-					if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => $errorMsg]);
-					return redirect()->back()->with('error', $errorMsg);
-				}
-			} else {
-				// Only Delhivery and ShipMozo are supported
-				if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => 'Pickup request is only supported for Delhivery and ShipMozo.']);
-				return redirect()->back()->with('error', 'Pickup request is only supported for Delhivery and ShipMozo.');
-			}
-
-			// Prepare data for insertion
-			$requestedData['pickup_start_time'] = $request->pickup_start_time ? date('H:i:s', strtotime($request->pickup_start_time)) : '';
-			$requestedData['pickup_end_time'] = $request->pickup_end_time ? date('H:i:s', strtotime($request->pickup_end_time)) : '';
-			$requestedData['pickup_id'] = $responseData['pickup_id'];
-			$requestedData['user_id'] = auth()->user()->id;
-			$requestedData['status'] = 1;
-			$requestedData['created_at'] = now();
-			$requestedData['updated_at'] = now();
-
-			// Save to the database
-			PickupRequest::create($requestedData);
-
-			DB::commit();
-
-			if ($request->ajax()) return response()->json(['status' => 'success', 'msg' => 'Pickup request created successfully.']);
-			return redirect()->back()->with('success', 'Pickup request created successfully.');
-		} catch (\Exception $e) {
-			DB::rollback();
-			if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => 'An unexpected error occurred. ' . $e->getMessage()]);
-			return redirect()->back()->with('error', 'An unexpected error occurred. Please try again. Error: ' . $e->getMessage());
+		if (!$shippingCompany) {
+			if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => 'Shipping company not found or inactive.']);
+			return redirect()->back()->with('error', 'Shipping company not found or inactive.');
 		}
+
+		// No active courier supports pickup requests through this endpoint
+		if ($request->ajax()) return response()->json(['status' => 'error', 'msg' => 'Pickup request is not supported for this courier.']);
+		return redirect()->back()->with('error', 'Pickup request is not supported for this courier.');
 	}
-
-	// public function cancelPickupRequest($pickupId)
-	// {
-	// 	DB::beginTransaction();
-
-	// 	try {
-	// 		// Validate if the shipping company exists
-	// 		$pickupRequest = PickupRequest::find($pickupId);
-	// 		if (!$pickupRequest) {
-	// 			return redirect()->back()->with('error', 'Pickup Request not found.');
-	// 		}
-
-	// 		// Validate if the shipping company exists
-	// 		$shippingCompany = ShippingCompany::where('status', 1)->where('id', 11)->first();
-	// 		if (!$shippingCompany) {
-	// 			return redirect()->back()->with('error', 'Shipping company not found or inactive.');
-	// 		}
-
-	// 		// Call the external service to create a pickup request
-	// 		$data = $this->delhiveryService->cancelPickupRequest($pickupRequest->pickup_id, $shippingCompany);
-
-	// 		// Handle API response errors
-	// 		if (!($data['success'] ?? false)) {
-	// 			$errorMsg = $data['response']['errors'][0]['message']
-	// 				?? ($data['response']['error']['message'] ?? 'An error occurred.');
-	// 			return redirect()->back()->with('error', $errorMsg);
-	// 		}
-
-	// 		// Ensure the response contains success confirmation
-	// 		if (isset($data['response']['success']) && !$data['response']['success']) {
-	// 			return redirect()->back()->with('error', $data['response']['error']['message'] ?? 'An error occurred.');
-	// 		}
-
-	// 		// Extract response data
-	// 		$responseMsg = $data['response']['data']['message'] ?? 'Cancelled pickup request successfully';
-
-	// 		$pickupRequest->update(['status' => 0, 'updated_at' => now()]);
-	// 		DB::commit();
-
-	// 		return redirect()->back()->with('success', $responseMsg);
-	// 	} catch (\Exception $e) {
-	// 		DB::rollback();
-	// 		return redirect()->back()->with('error', 'An unexpected error occurred. Please try again.');
-	// 	}
-	// }
 
 	private function authorizeWarehouseAccess(?CourierWarehouse $courierWarehouse): void
 	{

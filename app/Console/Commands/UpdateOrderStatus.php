@@ -4,8 +4,8 @@ namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
 use App\Models\Order; 
-use App\Models\StatusMapping; 
-use App\Services\DelhiveryB2CService; 
+use App\Models\StatusMapping;
+use App\Services\ShadowfaxService;
 use Illuminate\Support\Facades\Artisan;
 use Log;
 use App\Helpers\Helper;
@@ -26,12 +26,6 @@ class UpdateOrderStatus extends Command
 	 * @var string
 	 */
 	protected $description = 'Shipment status update command'; 
-	protected $delhiveryB2CService; 
-	public function __construct(DelhiveryB2CService $delhiveryB2CService)
-	{
-		parent::__construct(); 
-		$this->delhiveryB2CService = $delhiveryB2CService; 
-	}
  
 	public function handle()
 	{ 
@@ -98,9 +92,14 @@ class UpdateOrderStatus extends Command
 				'shipping_company_id' => $order->shipping_company_id
 			]);
 			
-			$newStatus = $this->calculateNewStatus($order); 
-			
-			if ($tempStatus !== $newStatus && !empty($newStatus)) {
+			// Delivered / cancelled / RTO delivered etc. never change again
+			if ($this->isFinalStatus($tempStatus)) {
+				continue;
+			}
+
+			$newStatus = $this->calculateNewStatus($order);
+
+			if (strtolower(trim((string) $tempStatus)) !== strtolower(trim((string) $newStatus)) && !empty($newStatus)) {
 				Log::info('Status changed', [
 					'order_id' => $order->id,
 					'awb' => $order->awb_number,
@@ -237,6 +236,13 @@ class UpdateOrderStatus extends Command
 		}
 	}
 
+	// Same final states as the Shadowfax webhook
+	private function isFinalStatus(?string $status): bool
+	{
+		$status = strtolower(trim(str_replace(['_', '-'], ' ', (string) $status)));
+		return in_array($status, ['delivered', 'cancelled', 'rto delivered', 'lost', 'damaged'], true);
+	}
+
 	private function calculateNewStatus($order)
 	{
 		$status = $order->status_courier;
@@ -252,47 +258,32 @@ class UpdateOrderStatus extends Command
 		}
 
 		try {
-			// Cache key for API responses to avoid duplicate calls
-			$cacheKey = "order_status_{$order->id}_{$order->awb_number}";
-			
-			switch ($shippingCompany->id) {
-				case 1: 
-					$status = $this->handleDelhiveryB2CTracking($order, $shippingCompany, $cacheKey);
-					break;
-				// Only Delhivery (ID=1) is supported for order status tracking
-				default:
-					Log::warning('Unsupported shipping company for tracking', [
+			if ($shippingCompany->isShadowfax()) {
+				// Track with the account the order was booked on (each Shadowfax account has its own API key)
+				$shadowfax = app(ShadowfaxService::class);
+				$tracking = $shadowfax->trackOrder($order->awb_number, $shippingCompany);
+				if (!($tracking['success'] ?? false)) {
+					Log::warning('Shadowfax tracking failed', [
+						'order_id' => $order->id,
+						'awb' => $order->awb_number,
 						'shipping_company_id' => $shippingCompany->id,
-						'order_id' => $order->id
+						'message' => $tracking['message'] ?? null,
 					]);
-					break;
+					return $status;
+				}
+
+				$courierStatus = $shadowfax->currentStatusFromTracking($tracking);
+				return $courierStatus !== null ? ShadowfaxService::normalizeStatus($courierStatus) : $status;
 			}
+
+			Log::warning('Unsupported shipping company for tracking', [
+				'shipping_company_id' => $shippingCompany->id,
+				'order_id' => $order->id
+			]);
 		} catch (\Exception $e) {
 			Log::error("Status tracking failed for order {$order->id}: " . $e->getMessage());
 		}
 
 		return $status;
-	}
-  
-	private function handleDelhiveryB2CTracking($order, $shippingCompany, $cacheKey)
-	{
-		$trackingResponse = $this->delhiveryB2CService->trackOrderByAwbNumber($order->awb_number, $shippingCompany);
-
-		if (isset($trackingResponse['response']['ShipmentData']) && !empty($trackingResponse['response']['ShipmentData'])) {
-			$shipstatus = $trackingResponse['response']['ShipmentData'][0]['Shipment']['Status']['Status'] ?? $order->status_courier;
-
-			if ($shipstatus != "Manifested") {
-				$statusType = $trackingResponse['response']['ShipmentData'][0]['Shipment']['Status']['StatusType'] ?? '';
-				
-				return match($statusType) {
-					"RT" => "rto",
-					"RT-IT" => "rto in transit",
-					"RT-DL" => "rto delivered", 
-					default => $shipstatus
-				};
-			}
-		}
-		
-		return $order->status_courier;
 	}
 }

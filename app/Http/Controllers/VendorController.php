@@ -10,7 +10,6 @@
 	use App\Models\CourierWarehouse;
 	use DB,Auth,File,Helper;
 	use App\Services\MasterService;
-	use App\Services\DelhiveryService;
 	use Illuminate\Support\Facades\Validator;
 	use Illuminate\Validation\Rule;
 	
@@ -22,7 +21,6 @@
 		{
 			$this->middleware('auth');
 			$this->masterService = new MasterService();
-			$this->delhiveryService = new DelhiveryService();
 		}
 		 
 		public function index()
@@ -157,7 +155,6 @@
 			try {
 				// Insert vendor
 				$vendor = Vendor::create($vendorData);
-				$shippingCompanies = ShippingCompany::whereIn('id', [2])->where('status', 1)->get();
 
 				if ($request->has('address') && is_array($request->address)) {
 					$vendorAddresses = [];
@@ -178,13 +175,6 @@
 
 					// Bulk insert addresses to reduce queries
 					VendorAddress::insert($vendorAddresses);
-
-					// Fetch inserted addresses for processing
-					$insertedAddresses = VendorAddress::where('vendor_id', $vendor->id)->get();
-
-					foreach ($insertedAddresses as $vendorAddress) {
-						$this->addWareHouseByAPI($vendor, $vendorAddress, $shippingCompanies);
-					}
 				}
 
 				DB::commit();
@@ -197,32 +187,6 @@
 			}
 		}
 
-		public function addWareHouseByAPI($vendor, $vendorAddress, $shippingCompanies)
-		{
-			if ($shippingCompanies->isNotEmpty()) {
-				foreach ($shippingCompanies as $shippingCompany) {
-					$data = $this->delhiveryService->createWarehouse($vendor, $vendorAddress, $shippingCompany);
-					 
-					if (!isset($data['success']) || !$data['success'] || (isset($data['response']['success']) && !$data['response']['success'])) {
-						continue;
-					}
-
-					if ($data['response']['success']) {
-						CourierWarehouse::create([
-							'vendor_address_id' => $vendorAddress->id,
-							'warehouse_name' => $vendorAddress->warehouse_name,
-							'shipping_id' => $shippingCompany->id,
-							'warehouse_status' => 1,
-							'api_response' => $data['response'],
-							'created_at' => now(),
-							'updated_at' => now(),
-						]); 
-						$vendorAddress->update(['warehouse_status' => 1, 'shipping_id' => $shippingCompany->id]);
-					}
-				}
-			}
-		}
-		   
 		public function editVendor($id)
 		{
 			$vendor = Vendor::with('vendorAddresses')->find($id);  
@@ -263,8 +227,6 @@
 				$vendorData['updated_at'] = $timestamp;
 				$vendor->update($vendorData);
 
-				$shippingCompanies = ShippingCompany::whereIn('id', [2])->where('status', 1)->get();
-				
 				// Process Addresses
 				if ($request->has('address') && is_array($request->address))
 				{
@@ -293,14 +255,7 @@
 							// Fill the model with new data without saving
 							$vendorAddress->fill($addressData);
 
-							// Check if warehouse_name has changed
-							if ($vendorAddress->isDirty('warehouse_name') || $vendorAddress->isDirty('address')) {
-								$vendorAddress->save();
-								$this->updateWareHouseByAPI($vendor, $vendorAddress, $shippingCompanies);
-							} else {
-								// If warehouse_name is unchanged, just save the updated address data
-								$vendorAddress->save();
-							}
+							$vendorAddress->save();
 						} else {
 							// Add new address
 							$addressData['created_at'] = $timestamp;
@@ -311,15 +266,6 @@
 					// Bulk insert new addresses
 					if (!empty($newVendorAddresses)) {
 						VendorAddress::insert($newVendorAddresses);
-
-						// Fetch newly inserted addresses
-						$insertedAddresses = VendorAddress::where('vendor_id', $vendor->id)
-							->where('created_at', $timestamp)
-							->get();
-
-						foreach ($insertedAddresses as $vendorAddress) {
-							$this->addWareHouseByAPI($vendor, $vendorAddress, $shippingCompanies);
-						}
 					}
 
 					// Delete removed addresses
@@ -339,56 +285,6 @@
 			}
 		}
 		
-		public function updateWareHouseByAPI($vendor, $vendorAddress, $shippingCompanies)
-		{ 
-			if ($shippingCompanies->isNotEmpty()) {
-				foreach ($shippingCompanies as $shippingCompany) {
-					$data = $this->delhiveryService->updateWarehouse($vendor, $vendorAddress, $shippingCompany);
-					dd(json_encode($data));
-					if (!isset($data['success']) || !$data['success'] || 
-						(isset($data['response']['success']) && !$data['response']['success'])) {
-						continue;
-					}
-					
-					if ($data['response']['success']) 
-					{
-						// Check if warehouse already exists
-						$existingWarehouse = CourierWarehouse::where('vendor_address_id', $vendorAddress->id)
-							->where('shipping_id', $shippingCompany->id)
-							->first();
-
-						if ($existingWarehouse) 
-						{
-							// Update existing warehouse
-							$existingWarehouse->update([
-								'warehouse_name' => $vendorAddress->warehouse_name,
-								'warehouse_status' => 1,
-								'api_response' => $data['response'],
-								'updated_at' => now(),
-							]);
-						} else {
-							// Create new warehouse if not exists
-							CourierWarehouse::create([
-								'vendor_address_id' => $vendorAddress->id,
-								'warehouse_name' => $vendorAddress->warehouse_name,
-								'shipping_id' => $shippingCompany->id,
-								'warehouse_status' => 1,
-								'api_response' => $data['response'],
-								'created_at' => now(),
-								'updated_at' => now(),
-							]);
-						}
-
-						// Update vendor address status
-						$vendorAddress->update([
-							'warehouse_status' => 1,
-							'shipping_id' => $shippingCompany->id
-						]);
-					}
-				}
-			}
-		}
- 
 		public function deleteVendor($id)
 		{ 
 			try {

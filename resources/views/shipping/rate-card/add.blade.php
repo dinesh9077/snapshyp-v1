@@ -362,8 +362,11 @@
 
                                         <div class="mb-4">
                                             <div class="d-flex justify-content-between align-items-center mb-1">
-                                                <h6 class="fw-bold text-primary mb-0" style="font-size: 21px; letter-spacing: 1px;">{{ $zoneSettings->first()->shippingCompany->name }}
-                                                </h6>
+                                                <div class="d-flex align-items-center">
+                                                    <h6 class="fw-bold text-primary mb-0" style="font-size: 21px; letter-spacing: 1px;">{{ $zoneSettings->first()->shippingCompany->name }}
+                                                    </h6>
+                                                    @include('shipping.rate-card.partials.copy-rates')
+                                                </div>
                                                 <div>
                                                     <select class="form-select select2" name="shipping[{{ $index }}][status]"
                                                         style="width:150px;">
@@ -585,6 +588,7 @@
 @endsection
 
 @push('js')
+@include('shipping.rate-card.partials.copy-rates-js')
 <script>
     const otherChargeMastersByCompany = @json(($otherChargeMasters ?? collect())->map(function ($rows) {
         return collect($rows)->values()->all();

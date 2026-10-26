@@ -481,95 +481,11 @@ class WoocommerceController extends Controller
      */
     private function cancelCourierOrder($order, $shippingCompany)
     {
-        $date = now()->toDateString();
-
-        try {
-            switch ($shippingCompany->id) {
-                case 1:
-                case 9:
-                    // XpressBees
-                    $url = $shippingCompany->url . 'api/shipments2/cancel';
-                    $response = Helper::callCurlApi(
-                        $url,
-                        ['awb' => $order->awb_number],
-                        Helper::xpressBeesToken($shippingCompany->id)
-                    );
-                    if (!($response['status'] ?? false)) {
-                        return null;
-                    }
-                    break;
-
-                case 7:
-                case 8:
-                    // Delhivery/Other
-                    $response = \Illuminate\Support\Facades\Http::asMultipart()
-                        ->attach('username', $shippingCompany->email)
-                        ->attach('password', $shippingCompany->password)
-                        ->attach('awbs', $order->awb_number)
-                        ->post($shippingCompany->url . 'apiv2/cancel_awb/');
-
-                    if (!$response->successful() || ($response->json()[0]['success'] ?? false) !== true) {
-                        return null;
-                    }
-                    break;
-
-                case 11:
-                    // Delhivery Service
-                    $delhiveryService = app(\App\Services\DelhiveryService::class);
-                    $response = $delhiveryService->cancelShipmentByLrNo($order->lr_no, $shippingCompany);
-                    if (!($response['success'] ?? false)) {
-                        return null;
-                    }
-                    break;
-
-                case 2:
-                    // Delhivery B2C
-                    $delhiveryB2CService = app(\App\Services\DelhiveryB2CService::class);
-                    $response = $delhiveryB2CService->cancelShipmentByAwbNumber($order->awb_number, $shippingCompany);
-                    if (!($response['success'] ?? false)) {
-                        return null;
-                    }
-                    break;
-
-                case 10:
-                    // Ekart
-                    $ekartService = app(\App\Services\EkartService::class);
-                    $response = $ekartService->cancelShipment($order, $shippingCompany->refresh());
-                    if (!($response['success'] ?? false)) {
-                        return null;
-                    }
-                    break;
-
-                case 12:
-                case 13:
-                    // DTDC
-                    $dtdcService = app(\App\Services\DtdcService::class);
-                    $response = $dtdcService->cancelShipment($order, $shippingCompany->refresh());
-                    if (!($response['success'] ?? false)) {
-                        return null;
-                    }
-                    break;
-
-                default:
-                    Log::warning('Unsupported shipping company for cancellation', [
-                        'shipping_company_id' => $shippingCompany->id
-                    ]);
-                    return null;
-            }
-
-            return [
-                'status_courier' => 'cancelled',
-                'order_cancel_date' => $date,
-                'reason_cancel' => "AWB {$order->awb_number} cancelled by courier",
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('Courier cancellation exception', [
-                'error' => $e->getMessage(),
-                'order_id' => $order->id,
-                'shipping_company_id' => $shippingCompany->id
-            ]);
-            return null;
-        }
+        // Only Shadowfax (id 1) is in use and its courier-side cancellation is not
+        // wired into this webhook, so no shipping company is supported here.
+        Log::warning('Unsupported shipping company for cancellation', [
+            'shipping_company_id' => $shippingCompany->id
+        ]);
+        return null;
     }
 }

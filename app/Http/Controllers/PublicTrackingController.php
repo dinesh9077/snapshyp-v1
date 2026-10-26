@@ -5,9 +5,6 @@ namespace App\Http\Controllers;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use App\Models\Order;
-use App\Services\DelhiveryB2CService;
-use App\Services\RoutxService;
-use App\Services\ShipMozo;
 use App\Services\ShadowfaxService;
 use App\Traits\ApiResponse;
 use Illuminate\Support\Facades\Validator;
@@ -64,7 +61,7 @@ class PublicTrackingController extends Controller
             $trackingHistories = [];
             $expectedDeliveryDate = "N/A";
 
-            if ($shippingCompany->id == 1) { // Shadowfax (Replaced Routx)
+            if ($shippingCompany->isShadowfax()) { // Shadowfax
                 $shadowfaxService = new ShadowfaxService();
                 $trackingResponse = $shadowfaxService->track($order->awb_number, $shippingCompany);
 
@@ -79,30 +76,6 @@ class PublicTrackingController extends Controller
                             'tag' => $value['status_id'] ?? 'SHADOWFAX'
                         ];
                     })->values()->toArray();
-                }
-            } elseif ($shippingCompany->id == 2) { // ShipMozo
-                $shipMozo = new ShipMozo();
-                $trackingResponse = $shipMozo->trackOrder($order->awb_number, $shippingCompany);
-
-                if ($trackingResponse['success'] ?? false) {
-                    $resp = $trackingResponse['response'];
-                    $scans = [];
-                    if (isset($resp['data']) && is_array($resp['data'])) {
-                        $scans = $resp['data']['scans'] ?? ($resp['data']['history'] ?? []);
-                        $expectedDeliveryDate = $resp['data']['edd'] ?? ($resp['data']['expected_delivery_date'] ?? 'N/A');
-                    } else {
-                        $scans = $resp['scans'] ?? ($resp['history'] ?? []);
-                        $expectedDeliveryDate = $resp['expected_delivery_date'] ?? ($resp['edd'] ?? 'N/A');
-                    }
-
-                    $trackingHistories = collect($scans)->map(function ($value) {
-                        return [
-                            'date' => date('d M Y, h:i A', strtotime($value['date_at'] ?? ($value['created_at'] ?? now()))),
-                            'status' => $value['remarks'] ?? ($value['status_name'] ?? ($value['activity'] ?? 'Update')),
-                            'location' => $value['location_name'] ?? ($value['location'] ?? 'N/A'),
-                            'tag' => $value['status_code'] ?? 'SM'
-                        ];
-                    });
                 }
             } else {
                 $trackingHistories = [];

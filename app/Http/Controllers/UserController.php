@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use App\Models\RateCard;
+use App\Models\ShippingCompany;
 use App\Models\LabelPreference;
 use App\Models\CodSetting;
 
@@ -214,6 +215,18 @@ class UserController extends Controller
 		return $actionButtons;
 	}
 
+	// Active Shadowfax accounts a seller can be assigned to
+	private function courierAccountsForForm()
+	{
+		return ShippingCompany::where('provider', ShippingCompany::PROVIDER_SHADOWFAX)->where('status', 1)->orderBy('id')->get(['id', 'name', 'is_default']);
+	}
+
+	// Empty or unknown means "use the default account"
+	private function validCourierAccountId($id)
+	{
+		return $id && ShippingCompany::whereKey($id)->where('provider', ShippingCompany::PROVIDER_SHADOWFAX)->exists() ? (int) $id : null;
+	}
+
 	public function createUser()
 	{
 		$authUser = Auth::user();
@@ -222,7 +235,9 @@ class UserController extends Controller
 		$b2cRateCards = $this->getClientFormRateCards($authUser, 'b2c');
 		$b2bRateCards = $this->getClientFormRateCards($authUser, 'b2b');
 
-		return view('users.create', compact('b2cRateCards', 'b2bRateCards', 'canManageCharges', 'isFranchiseCreator'));
+		$courierAccounts = $this->courierAccountsForForm();
+
+		return view('users.create', compact('b2cRateCards', 'b2bRateCards', 'canManageCharges', 'isFranchiseCreator', 'courierAccounts'));
 	}
 
 	public function storeUser(Request $request)
@@ -237,6 +252,7 @@ class UserController extends Controller
 			$data['b2c_rate_card_id'] = (int) $request->input('b2c_rate_card_id', 0);
 			$data['b2b_rate_card_id'] = (int) $request->input('b2b_rate_card_id', 0);
 			$data['rate_card_id'] = $data['b2c_rate_card_id'];
+		$data['assigned_shipping_company_id'] = $this->validCourierAccountId($request->input('assigned_shipping_company_id'));
 
 		$data['password'] = Hash::make($request->password);
 		$data['xpass'] = $request->password; // stored encrypted (User casts xpass)
@@ -320,7 +336,9 @@ class UserController extends Controller
 		$b2cRateCards = $this->getClientFormRateCards($authUser, 'b2c');
 		$b2bRateCards = $this->getClientFormRateCards($authUser, 'b2b');
 
-		return view('users.edit', compact('user', 'b2cRateCards', 'b2bRateCards', 'canManageCharges', 'isFranchiseCreator'));
+		$courierAccounts = $this->courierAccountsForForm();
+
+		return view('users.edit', compact('user', 'b2cRateCards', 'b2bRateCards', 'canManageCharges', 'isFranchiseCreator', 'courierAccounts'));
 	}
 
 	public function updateUser(Request $request, $userId)
@@ -339,6 +357,7 @@ class UserController extends Controller
 			$data['b2c_rate_card_id'] = (int) $request->input('b2c_rate_card_id', 0);
 			$data['b2b_rate_card_id'] = (int) $request->input('b2b_rate_card_id', 0);
 			$data['rate_card_id'] = $data['b2c_rate_card_id'];
+		$data['assigned_shipping_company_id'] = $this->validCourierAccountId($request->input('assigned_shipping_company_id'));
 
 		if ($canManageCharges) {
 			$data['b2c_charge_type'] = (int) $request->input('b2c_charge_type', 1);
